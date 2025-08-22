@@ -231,11 +231,23 @@ private:
     float standalone_confidence;
     bool standalone_detection_active;
     
-    // HSV ranges for red color detection
-    cv::Scalar lower_red1 = cv::Scalar(0, 120, 70);
-    cv::Scalar upper_red1 = cv::Scalar(10, 255, 255);
-    cv::Scalar lower_red2 = cv::Scalar(170, 120, 70);
+    // HSV ranges for red color detection (tightened for better precision)
+    cv::Scalar lower_red1 = cv::Scalar(0, 140, 80);
+    cv::Scalar upper_red1 = cv::Scalar(8, 255, 255);
+    cv::Scalar lower_red2 = cv::Scalar(172, 140, 80);
     cv::Scalar upper_red2 = cv::Scalar(180, 255, 255);
+    
+    // Arrow detection parameters
+    struct ArrowFeatures {
+        double triangularity_score;    // How triangular is the arrow tip
+        double symmetry_score;         // How symmetric is the arrow
+        double shaft_score;           // How well-defined is the arrow shaft
+        double edge_density;          // Density of edges in expected arrow regions
+        double corner_count;          // Number of significant corners (should be 3-7 for arrows)
+        cv::Point2f tip_point;        // Detected tip location
+        cv::Point2f base_center;      // Center of the arrow base
+        double tip_confidence;        // Confidence that tip_point is actually the tip
+    };
     
 public:
     ArrowDetectionProcess(bool enable_streaming = false, int port = 8080) : 
@@ -461,6 +473,164 @@ public:
         return mask;
     }
     
+    // Enhanced arrow feature analysis
+    ArrowFeatures analyzeArrowFeatures(const std::vector<cv::Point>& contour, const cv::Mat& originalImage) {
+        ArrowFeatures features = {};
+        
+        if (contour.size() < 5) return features;
+        
+        // Get basic geometric properties
+        cv::Rect bbox = cv::boundingRect(contour);
+        cv::Moments moments = cv::moments(contour);
+        if (moments.m00 == 0) return features;
+        
+        cv::Point2f centroid(moments.m10 / moments.m00, moments.m01 / moments.m00);
+        
+        // 1. Corner Detection for triangularity analysis
+        std::vector<cv::Point> approx;
+        double epsilon = 0.02 * cv::arcLength(contour, true);
+        cv::approxPolyDP(contour, approx, epsilon, true);
+        features.corner_count = approx.size();
+        
+        // 2. Find potential tip point using corner analysis
+        std::vector<double> corner_angles;
+        for (size_t i = 0; i < approx.size(); i++) {
+            cv::Point p1 = approx[(i - 1 + approx.size()) % approx.size()];
+            cv::Point p2 = approx[i];
+            cv::Point p3 = approx[(i + 1) % approx.size()];
+            
+            cv::Vec2f v1(p1.x - p2.x, p1.y - p2.y);
+            cv::Vec2f v2(p3.x - p2.x, p3.y - p2.y);
+            
+            double angle = acos(v1.dot(v2) / (cv::norm(v1) * cv::norm(v2) + 1e-6));
+            corner_angles.push_back(angle * 180.0 / CV_PI);
+        }
+        
+        // Find sharpest corner (likely arrow tip)
+        if (!corner_angles.empty()) {
+            auto min_it = std::min_element(corner_angles.begin(), corner_angles.end());
+            size_t tip_idx = std::distance(corner_angles.begin(), min_it);
+            if (tip_idx < approx.size()) {
+                features.tip_point = cv::Point2f(approx[tip_idx]);
+                features.tip_confidence = 180.0 - *min_it;  // Sharper corners have higher confidence
+            }
+        }
+        
+        // 3. Triangularity Score - how triangular is the overall shape
+        if (features.corner_count >= 3 && features.corner_count <= 7) {
+            features.triangularity_score = 100.0 - abs(5.0 - features.corner_count) * 15.0; // Optimal 5 corners for arrow
+            if (!corner_angles.empty()) {
+                double min_angle = *std::min_element(corner_angles.begin(), corner_angles.end());
+                if (min_angle < 60.0) { // Sharp tip
+                    features.triangularity_score += 20.0;
+                }
+            }
+        }
+        
+        // 4. Symmetry Analysis
+        cv::RotatedRect fitted_rect = cv::fitEllipse(contour);
+        double orientation = fitted_rect.angle * CV_PI / 180.0;
+        
+        // Check if shape is symmetric along major axis
+        cv::Mat symmetry_mask = cv::Mat::zeros(bbox.height, bbox.width, CV_8UC1);
+        std::vector<cv::Point> translated_contour;
+        for (const auto& pt : contour) {
+            translated_contour.push_back(cv::Point(pt.x - bbox.x, pt.y - bbox.y));
+        }
+        cv::fillPoly(symmetry_mask, std::vector<std::vector<cv::Point>>{translated_contour}, cv::Scalar(255));
+        
+        // Simple symmetry check - compare left and right halves
+        cv::Rect left_half(0, 0, bbox.width / 2, bbox.height);
+        cv::Rect right_half(bbox.width / 2, 0, bbox.width / 2, bbox.height);
+        
+        cv::Mat left_roi = symmetry_mask(left_half);
+        cv::Mat right_roi = symmetry_mask(right_half);
+        cv::flip(right_roi, right_roi, 1); // Mirror right half
+        
+        cv::Mat diff;
+        cv::absdiff(left_roi, right_roi, diff);
+        features.symmetry_score = 100.0 - (cv::sum(diff)[0] / (bbox.width * bbox.height / 2.0 * 255.0)) * 100.0;
+        
+        // 5. Shaft Score - arrows should have a defined shaft/body
+        double aspect_ratio = (double)bbox.width / bbox.height;
+        if (aspect_ratio > 1.2 || aspect_ratio < 0.8) { // Not too square
+            features.shaft_score = std::min(80.0, aspect_ratio > 1.0 ? (aspect_ratio - 1.0) * 40.0 : (1.0 / aspect_ratio - 1.0) * 40.0);
+        }
+        
+        // 6. Edge Density Analysis - arrows have specific edge patterns
+        cv::Mat roi = originalImage(bbox);
+        cv::Mat edges;
+        cv::Canny(roi, edges, 50, 150);
+        features.edge_density = cv::sum(edges)[0] / (bbox.area() * 255.0) * 100.0;
+        
+        // 7. Calculate base center (opposite to tip)
+        if (features.tip_confidence > 0) {
+            // Find point furthest from tip
+            double max_dist = 0;
+            for (const auto& pt : contour) {
+                double dist = cv::norm(cv::Point2f(pt) - features.tip_point);
+                if (dist > max_dist) {
+                    max_dist = dist;
+                    features.base_center = cv::Point2f(pt);
+                }
+            }
+        }
+        
+        return features;
+    }
+    
+    // Enhanced arrow shape validation using multiple features
+    bool isValidArrowShape(const std::vector<cv::Point>& contour, double area, const cv::Mat& originalImage) {
+        if (contour.size() < 5) return false;
+        
+        // Basic area and geometric checks (kept from original)
+        int frameArea = 640 * 480; 
+        double minAreaRatio = 0.005; // Reduced minimum size to 0.5%
+        double maxAreaRatio = 0.95; 
+        
+        double minArea = frameArea * minAreaRatio;
+        double maxArea = frameArea * maxAreaRatio;
+        
+        if (area < minArea || area > maxArea) return false;
+        
+        cv::Rect boundingRect = cv::boundingRect(contour);
+        double aspectRatio = (double)boundingRect.width / boundingRect.height;
+        
+        // Relaxed aspect ratio for various arrow orientations
+        if (aspectRatio < 0.2 || aspectRatio > 5.0) return false;
+        
+        // Enhanced feature analysis
+        ArrowFeatures features = analyzeArrowFeatures(contour, originalImage);
+        
+        // Multi-criteria arrow validation
+        int score = 0;
+        
+        // Corner count should be reasonable for arrows (3-7 corners)
+        if (features.corner_count >= 3 && features.corner_count <= 7) score += 20;
+        
+        // Triangularity score
+        if (features.triangularity_score > 50.0) score += 25;
+        
+        // Tip confidence (sharp corners suggest arrow tips)
+        if (features.tip_confidence > 40.0) score += 30;
+        
+        // Symmetry score
+        if (features.symmetry_score > 30.0) score += 15;
+        
+        // Edge density (arrows have distinctive edge patterns)
+        if (features.edge_density > 10.0 && features.edge_density < 60.0) score += 10;
+        
+        // Original solidity check (kept for compatibility)
+        std::vector<cv::Point> hull;
+        cv::convexHull(contour, hull);
+        double hullArea = cv::contourArea(hull);
+        double solidity = area / hullArea;
+        if (solidity >= 0.5 && solidity <= 0.95) score += 10;
+        
+        // Require a minimum combined score to be considered an arrow
+        return score >= 70; // Out of 130 possible points
+    }
+    
     std::vector<cv::Point> mergeNearbyContours(const std::vector<std::vector<cv::Point>>& contours, 
                                               const std::vector<double>& areas) {
         if (contours.empty()) return {};
@@ -508,111 +678,116 @@ public:
         return mergedContour;
     }
     
-    bool isValidArrowShape(const std::vector<cv::Point>& contour, double area) {
-        if (contour.size() < 5) return false;
-        
-        // Make area thresholds relative to frame size for scale adaptation
-        int frameArea = 640 * 480; // Camera resolution
-        double minAreaRatio = 0.02; // Minimum 2% of frame
-        double maxAreaRatio = 0.95; // Maximum 95% of frame
-        
-        double minArea = frameArea * minAreaRatio;
-        double maxArea = frameArea * maxAreaRatio;
-        
-        if (area < minArea || area > maxArea) return false;
-        
-        cv::Rect boundingRect = cv::boundingRect(contour);
-        double aspectRatio = (double)boundingRect.width / boundingRect.height;
-        
-        // More lenient aspect ratio for larger arrows
-        if (aspectRatio < 0.15 || aspectRatio > 6.0) return false;
-        
-        std::vector<cv::Point> hull;
-        cv::convexHull(contour, hull);
-        
-        if (hull.size() < 4) return false;
-        
-        double hullArea = cv::contourArea(hull);
-        double solidity = area / hullArea;
-        
-        return (solidity >= 0.5 && solidity <= 0.98);
-    }
-    
-    double calculateArrowConfidence(const std::vector<cv::Point>& contour, double area, const std::string& direction) {
+    // Enhanced confidence calculation using arrow features
+    double calculateArrowConfidence(const std::vector<cv::Point>& contour, double area, const std::string& direction, const cv::Mat& originalImage) {
         if (contour.size() < 5 || direction == "UNKNOWN") return 0.0;
         
         cv::Rect boundingRect = cv::boundingRect(contour);
         double aspectRatio = (double)boundingRect.width / boundingRect.height;
         
-        // Calculate confidence based on multiple factors
+        // Get enhanced arrow features
+        ArrowFeatures features = analyzeArrowFeatures(contour, originalImage);
+        
         double confidence = 0.0;
         
-        // Factor 1: Solidity (how filled the shape is)
-        std::vector<cv::Point> hull;
-        cv::convexHull(contour, hull);
-        double hullArea = cv::contourArea(hull);
-        double solidity = area / hullArea;
+        // Factor 1: Arrow-specific geometric features (40% of total)
+        confidence += features.triangularity_score * 0.2;  // 20% weight
+        confidence += features.tip_confidence * 0.2;       // 20% weight
         
-        if (solidity >= 0.7 && solidity <= 0.9) {
-            confidence += 30.0; // Perfect solidity range
-        } else if (solidity >= 0.6 && solidity <= 0.95) {
-            confidence += 20.0; // Good solidity range
-        } else {
-            confidence += 10.0; // Acceptable range
+        // Factor 2: Shape consistency (25% of total)
+        if (features.corner_count >= 3 && features.corner_count <= 7) {
+            confidence += 15.0; // Good corner count
+            if (features.corner_count == 5 || features.corner_count == 6) {
+                confidence += 10.0; // Optimal corner count for arrows
+            }
         }
         
-        // Factor 2: Aspect ratio appropriateness for arrow shapes
-        if (aspectRatio >= 1.2 && aspectRatio <= 3.0) {
-            confidence += 25.0; // Ideal arrow proportions
-        } else if (aspectRatio >= 0.5 && aspectRatio <= 4.0) {
-            confidence += 15.0; // Acceptable proportions
-        } else {
-            confidence += 5.0; // Poor proportions
-        }
+        // Factor 3: Symmetry (15% of total)
+        confidence += features.symmetry_score * 0.15;
         
-        // Factor 3: Area appropriateness (heavily favor large arrows)
+        // Factor 4: Size appropriateness (20% of total) - heavily favor larger arrows
         int frameArea = 640 * 480;
         double areaRatio = area / frameArea;
         
-        if (areaRatio >= 0.1) {
-            confidence += 40.0; // Very large arrows (>10% of frame) - STRONG preference
-        } else if (areaRatio >= 0.05) {
-            confidence += 35.0; // Large arrows (5-10% of frame) - HIGH preference
+        if (areaRatio >= 0.08) {
+            confidence += 20.0; // Very large arrows
+        } else if (areaRatio >= 0.04) {
+            confidence += 18.0; // Large arrows
         } else if (areaRatio >= 0.02) {
-            confidence += 30.0; // Medium-large arrows (2-5% of frame) - GOOD preference
+            confidence += 15.0; // Medium-large arrows
         } else if (areaRatio >= 0.01) {
-            confidence += 15.0; // Medium arrows (1-2% of frame) - LOW preference
+            confidence += 10.0; // Medium arrows
         } else if (areaRatio >= 0.005) {
-            confidence += 5.0;  // Small arrows (0.5-1% of frame) - VERY LOW preference
-        } else {
-            confidence += 0.0;  // Tiny arrows - NO bonus (effectively filtered out)
+            confidence += 5.0;  // Small arrows
         }
         
-        // Factor 4: Contour complexity (arrows should have reasonable complexity)
-        double perimeter = cv::arcLength(contour, true);
-        double complexity = (perimeter * perimeter) / area; // Isoperimetric ratio
-        
-        if (complexity >= 12.0 && complexity <= 25.0) {
-            confidence += 20.0; // Good arrow-like complexity
-        } else if (complexity >= 8.0 && complexity <= 35.0) {
-            confidence += 10.0; // Acceptable complexity
+        // Factor 5: Aspect ratio appropriateness (10% of total)
+        if (aspectRatio >= 1.2 && aspectRatio <= 3.0) {
+            confidence += 10.0; // Ideal arrow proportions
+        } else if (aspectRatio >= 0.5 && aspectRatio <= 4.0) {
+            confidence += 7.0;  // Acceptable proportions
         } else {
-            confidence += 5.0; // Poor complexity
+            confidence += 3.0;  // Poor proportions
         }
         
-        // Ensure confidence doesn't exceed 100%
-        return std::min(confidence, 100.0);
+        // Factor 6: Edge density bonus (5% of total)
+        if (features.edge_density > 10.0 && features.edge_density < 50.0) {
+            confidence += 5.0; // Good edge patterns
+        }
+        
+        // Direction consistency bonus
+        if (direction != "UNKNOWN" && features.tip_confidence > 30.0) {
+            confidence += 5.0; // Clear directional indication
+        }
+        
+        // Penalty for very complex shapes (likely not arrows)
+        if (features.corner_count > 10) {
+            confidence -= 15.0;
+        }
+        
+        // Ensure confidence is within bounds
+        return std::max(0.0, std::min(confidence, 100.0));
     }
     
-    std::string determineArrowDirection(const std::vector<cv::Point>& contour) {
+    // Enhanced direction detection using arrow features
+    std::string determineArrowDirection(const std::vector<cv::Point>& contour, const cv::Mat& originalImage) {
         if (contour.size() < 6) return "UNKNOWN";
         
-        // Use distance from centroid to find tip
+        // Get arrow features including tip detection
+        ArrowFeatures features = analyzeArrowFeatures(contour, originalImage);
+        
+        if (features.tip_confidence < 20.0) {
+            return "UNKNOWN"; // Not confident enough about tip location
+        }
+        
+        cv::Rect bbox = cv::boundingRect(contour);
         cv::Moments moments = cv::moments(contour);
         if (moments.m00 == 0) return "UNKNOWN";
         cv::Point2f centroid(moments.m10 / moments.m00, moments.m01 / moments.m00);
         
-        cv::Rect bbox = cv::boundingRect(contour);
+        // Use detected tip point to determine direction
+        cv::Point2f tip = features.tip_point;
+        cv::Point2f base = features.base_center;
+        
+        // Calculate direction vector from base to tip
+        cv::Vec2f direction_vector = tip - base;
+        double angle = atan2(direction_vector[1], direction_vector[0]) * 180.0 / CV_PI;
+        
+        // Normalize angle to 0-360 range
+        if (angle < 0) angle += 360.0;
+        
+        // Determine direction based on angle ranges
+        if (angle >= 315.0 || angle < 45.0) {
+            return "RIGHT";
+        } else if (angle >= 45.0 && angle < 135.0) {
+            return "DOWN";
+        } else if (angle >= 135.0 && angle < 225.0) {
+            return "LEFT";
+        } else if (angle >= 225.0 && angle < 315.0) {
+            return "UP";
+        }
+        
+        // Fallback to original method if tip-based detection fails
         bool isHorizontal = bbox.width > bbox.height * 1.2;
         bool isVertical = bbox.height > bbox.width * 1.2;
         
@@ -635,54 +810,28 @@ public:
             return sqrt(pow(pt.x - centroid.x, 2) + pow(pt.y - centroid.y, 2));
         };
         
-        std::string direction = "UNKNOWN";
-        
         if (isHorizontal) {
             double leftDist = distance(leftMost);
             double rightDist = distance(rightMost);
             
-            // For these arrow images, the base is further from centroid than the tip
-            // So arrow points AWAY from the furthest extreme
-            if (leftDist > rightDist * 1.1) {  // 10% threshold to avoid noise
-                direction = "RIGHT";  // Left base further -> points RIGHT
-            } else if (rightDist > leftDist * 1.1) {
-                direction = "LEFT";   // Right base further -> points LEFT
+            if (leftDist > rightDist * 1.15) {  // Increased threshold for better accuracy
+                return "RIGHT";
+            } else if (rightDist > leftDist * 1.15) {
+                return "LEFT";
             }
             
         } else if (isVertical) {
             double topDist = distance(topMost);
             double bottomDist = distance(bottomMost);
             
-            // For these arrow images, the base is further from centroid than the tip
-            // So arrow points AWAY from the furthest extreme
-            if (topDist > bottomDist * 1.1) {  // 10% threshold
-                direction = "DOWN";   // Top base further -> points DOWN  
-            } else if (bottomDist > topDist * 1.1) {
-                direction = "UP";     // Bottom base further -> points UP
-            }
-            
-        } else {
-            // For square arrows, check all directions
-            double leftDist = distance(leftMost);
-            double rightDist = distance(rightMost);
-            double topDist = distance(topMost);
-            double bottomDist = distance(bottomMost);
-            
-            double maxDist = std::max({leftDist, rightDist, topDist, bottomDist});
-            
-            // Arrow points away from the furthest extreme (for these arrow designs)
-            if (maxDist == leftDist && leftDist > rightDist * 1.1) {
-                direction = "RIGHT";  // Left base further -> points RIGHT
-            } else if (maxDist == rightDist && rightDist > leftDist * 1.1) {
-                direction = "LEFT";   // Right base further -> points LEFT
-            } else if (maxDist == topDist && topDist > bottomDist * 1.1) {
-                direction = "DOWN";   // Top base further -> points DOWN
-            } else if (maxDist == bottomDist && bottomDist > topDist * 1.1) {
-                direction = "UP";     // Bottom base further -> points UP
+            if (topDist > bottomDist * 1.15) {
+                return "DOWN";
+            } else if (bottomDist > topDist * 1.15) {
+                return "UP";
             }
         }
         
-        return direction;
+        return "UNKNOWN";
     }
     
     std::vector<std::vector<cv::Point>> filterSpatiallyCloseContours(const std::vector<std::vector<cv::Point>>& contours) {
@@ -860,16 +1009,16 @@ public:
         for (size_t i = 0; i < arrowCandidates.size(); i++) {
             double area = cv::contourArea(arrowCandidates[i]);
             
-            if (!isValidArrowShape(arrowCandidates[i], area)) continue;
+            if (!isValidArrowShape(arrowCandidates[i], area, frame)) continue;
             
-            std::string direction = determineArrowDirection(arrowCandidates[i]);
+            std::string direction = determineArrowDirection(arrowCandidates[i], frame);
             
             if (direction != "UNKNOWN") {
                 // Calculate confidence for this detection
-                double confidence = calculateArrowConfidence(arrowCandidates[i], area, direction);
+                double confidence = calculateArrowConfidence(arrowCandidates[i], area, direction, frame);
                 
-                // Only consider arrows with at least 70% confidence
-                if (confidence >= 70.0) {
+                // Only consider arrows with at least 75% confidence (increased threshold)
+                if (confidence >= 75.0) {
                     // Prefer larger arrows
                     if (area > bestArrowArea) {
                         bestArrowIndex = i;
@@ -906,15 +1055,33 @@ public:
                          << "\nTimestamp: " << timestamp.str()
                          << "\nDirection: " << bestDirection
                          << "\nConfidence: " << std::fixed << std::setprecision(1) << bestConfidence << "%"
-                         << "\nArea: " << (int)bestArrowArea 
+                         << "\nArea: " << (int)bestArrowArea;
+                
+                // Add enhanced detection details
+                ArrowFeatures features = analyzeArrowFeatures(arrowCandidates[bestArrowIndex], frame);
+                std::cout << "\nDetection Details:"
+                         << "\n  - Corners: " << features.corner_count
+                         << "\n  - Triangularity: " << std::setprecision(1) << features.triangularity_score << "%"
+                         << "\n  - Tip Confidence: " << std::setprecision(1) << features.tip_confidence << "%"
+                         << "\n  - Symmetry: " << std::setprecision(1) << features.symmetry_score << "%"
+                         << "\n  - Edge Density: " << std::setprecision(1) << features.edge_density << "%"
                          << "\n=====================\n" << std::endl;
                 
                 // Draw overlay for live streaming (if overlayFrame is provided)
                 if (overlayFrame != nullptr) {
                     cv::Rect bestBoundingRect = cv::boundingRect(arrowCandidates[bestArrowIndex]);
+                    ArrowFeatures features = analyzeArrowFeatures(arrowCandidates[bestArrowIndex], frame);
                     
                     // Draw bounding rectangle around detected arrow
                     cv::rectangle(*overlayFrame, bestBoundingRect, cv::Scalar(0, 255, 0), 3);
+                    
+                    // Draw detected tip point
+                    if (features.tip_confidence > 20.0) {
+                        cv::circle(*overlayFrame, cv::Point((int)features.tip_point.x, (int)features.tip_point.y), 8, cv::Scalar(0, 0, 255), -1);
+                        cv::putText(*overlayFrame, "TIP", 
+                                   cv::Point((int)features.tip_point.x - 15, (int)features.tip_point.y - 15), 
+                                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+                    }
                     
                     // Draw direction text above the arrow
                     cv::putText(*overlayFrame, bestDirection, 
@@ -927,22 +1094,21 @@ public:
                                cv::Point(bestBoundingRect.x, bestBoundingRect.y - 15), 
                                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                     
-                    // Draw area and aspect ratio info below the arrow
-                    double bestAspectRatio = (double)bestBoundingRect.width / bestBoundingRect.height;
-                    std::string info = "Area: " + std::to_string((int)bestArrowArea) + 
-                                      " AR: " + std::to_string(bestAspectRatio).substr(0, 4);
-                    cv::putText(*overlayFrame, info, 
+                    // Draw enhanced feature info below the arrow
+                    std::string featureInfo = "Corners:" + std::to_string((int)features.corner_count) + 
+                                            " Tri:" + std::to_string((int)features.triangularity_score) + "%";
+                    cv::putText(*overlayFrame, featureInfo, 
                                cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 25), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+                               cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
                     
                     // Draw contour outline for better visualization
                     std::vector<std::vector<cv::Point>> contours_draw = {arrowCandidates[bestArrowIndex]};
                     cv::drawContours(*overlayFrame, contours_draw, -1, cv::Scalar(255, 0, 0), 2);
                     
-                    // Add "WALL-E DETECTED" label to distinguish this arrow
-                    cv::putText(*overlayFrame, "WALL-E DETECTED", 
+                    // Add "ENHANCED ARROW DETECTED" label to distinguish this detection
+                    cv::putText(*overlayFrame, "ENHANCED ARROW DETECTED", 
                                cv::Point(bestBoundingRect.x, bestBoundingRect.y - 70), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 0), 2);
+                               cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
                 }
                 
                 lastDetectedDirection = bestDirection;
@@ -1027,20 +1193,14 @@ public:
                 processFrameWithOverlay(frame, &displayFrame);
                 
                 // Add real-time status overlay to display frame
-                std::string modeText = standalone_mode ? "Standalone" : "Wall-E";
-                std::string statusText = modeText + " Arrow Detection | Direction: " + arrowDirectionToString(getDetectedDirection());
+                std::string statusText = "Direction: " + arrowDirectionToString(getDetectedDirection());
                 cv::putText(displayFrame, statusText, cv::Point(10, 30), 
                            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
                 
-                std::string infoText = "Frames: " + std::to_string(frameCount) + 
-                                      " | Confidence: " + std::to_string((int)getConfidence()) + "%";
-                cv::putText(displayFrame, infoText, cv::Point(10, 60), 
-                           cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
-                
                 // Add system status
                 std::string systemText = std::string("System: ") + (isEmergencyStop() ? "EMERGENCY" : "NORMAL") +
-                                        " | Balance: " + std::to_string(getBalanceAngle()).substr(0, 5) + "°";
-                cv::putText(displayFrame, systemText, cv::Point(10, 90), 
+                                        " | Balance: " + std::to_string(getBalanceAngle()).substr(0, 5) + " deg";
+                cv::putText(displayFrame, systemText, cv::Point(10, 60), 
                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 0), 2);
                 
                 // Add streaming status if enabled
