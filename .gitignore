@@ -1,0 +1,26 @@
+# Compiled executables
+imu_process
+motor_process
+control_interface
+arrow_detection_process
+
+# Object files
+*.o
+
+# Backup files
+*~
+*.bak
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Shared memory files (runtime)
+/dev/shm/wall_e_balance
+
+# IDE files
+.vscode/
+.idea/
+
+# Log files
+*.log
