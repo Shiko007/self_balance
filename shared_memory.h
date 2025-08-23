@@ -113,6 +113,14 @@ struct BalanceData {
     volatile bool arrow_detection_active;              // Arrow detection process is running
     volatile bool arrow_detection_enabled;             // Arrow detection functionality enabled
     
+    // Ultrasonic sensor data
+    volatile float ultrasonic_distance_cm;             // Distance measurement in centimeters
+    volatile uint64_t ultrasonic_timestamp;            // Last ultrasonic reading timestamp (microseconds)
+    volatile bool ultrasonic_active;                   // Ultrasonic process is running
+    volatile bool ultrasonic_enabled;                  // Ultrasonic functionality enabled
+    volatile float ultrasonic_min_distance;            // Minimum safe distance (cm)
+    volatile bool obstacle_detected;                   // Obstacle within minimum distance
+    
     // Constructor to initialize values
     BalanceData() {
         memset(this, 0, sizeof(BalanceData));
@@ -144,6 +152,12 @@ struct BalanceData {
         arrow_timestamp = 0;
         arrow_detection_active = false;
         arrow_detection_enabled = false;
+        ultrasonic_distance_cm = 999.0f;  // Initialize to max value
+        ultrasonic_timestamp = 0;
+        ultrasonic_active = false;
+        ultrasonic_enabled = true;  // Enable by default
+        ultrasonic_min_distance = 20.0f;  // 20cm minimum safe distance
+        obstacle_detected = false;
     }
 };
 

@@ -7,13 +7,14 @@ LIBS = -li2c -lrt
 OPENCV_FLAGS = `pkg-config --cflags --libs opencv4`
 
 # Target binaries
-TARGETS = imu_process motor_process control_interface arrow_detection_process
+TARGETS = imu_process motor_process control_interface arrow_detection_process ultrasonic_process
 
 # Source files
 IMU_SRC = imu_process.cpp
 MOTOR_SRC = motor_process.cpp
 CONTROL_SRC = control_interface.cpp
 ARROW_SRC = arrow_detection_process.cpp
+ULTRASONIC_SRC = ultrasonic_process.cpp
 
 # Header files
 HEADERS = shared_memory.h
@@ -38,6 +39,10 @@ arrow_detection_process: $(ARROW_SRC) $(HEADERS)
 	@echo "Building arrow detection process..."
 	$(CXX) $(CXXFLAGS) $(ARROW_SRC) -o arrow_detection_process $(LIBS) $(OPENCV_FLAGS)
 
+ultrasonic_process: $(ULTRASONIC_SRC) $(HEADERS)
+	@echo "Building ultrasonic sensor process..."
+	$(CXX) $(CXXFLAGS) $(ULTRASONIC_SRC) -o ultrasonic_process $(LIBS)
+
 # Install and setup
 install: all
 	@echo "Installing Wall-E system..."
@@ -45,6 +50,7 @@ install: all
 	sudo cp motor_process /usr/local/bin/
 	sudo cp control_interface /usr/local/bin/
 	sudo cp arrow_detection_process /usr/local/bin/
+	sudo cp ultrasonic_process /usr/local/bin/
 	@echo "Installation complete!"
 
 # Setup system permissions
@@ -163,6 +169,7 @@ stop:
 	@pkill -f motor_process || true
 	@pkill -f control_interface || true
 	@pkill -f arrow_detection_process || true
+	@pkill -f ultrasonic_process || true
 	@pkill -f rpicam-vid || true
 	@echo "All processes stopped."
 
@@ -181,7 +188,7 @@ debug: clean all
 status:
 	@echo "=== Wall-E System Status ==="
 	@echo "Processes running:"
-	@ps aux | grep -E "(imu_process|motor_process|control_interface|arrow_detection_process)" | grep -v grep || echo "No Wall-E processes running"
+	@ps aux | grep -E "(imu_process|motor_process|control_interface|arrow_detection_process|ultrasonic_process)" | grep -v grep || echo "No Wall-E processes running"
 	@echo ""
 	@echo "Shared memory:"
 	@ls -la /dev/shm/ | grep wall_e || echo "No shared memory segments found"
@@ -205,6 +212,7 @@ help:
 	@echo "  motor_process    - Build motor process only"
 	@echo "  control_interface - Build control interface only"
 	@echo "  arrow_detection_process - Build arrow detection process only"
+	@echo "  ultrasonic_process - Build ultrasonic sensor process only"
 	@echo ""
 	@echo "System setup:"
 	@echo "  setup            - Complete system setup (permissions, I2C, PWM)"

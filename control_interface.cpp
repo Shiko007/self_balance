@@ -102,6 +102,11 @@ void printStatus(BalanceData* data) {
         std::cout << "DIR: " << arrowDirectionToString(data->detected_arrow_direction) 
                   << "(" << std::setprecision(0) << data->arrow_confidence << "%) | ";
     }
+    std::cout << "ULTRASONIC: " << (data->ultrasonic_active ? "OK" : "OFF") << " | ";
+    if (data->ultrasonic_active) {
+        std::cout << "DIST: " << std::setprecision(1) << data->ultrasonic_distance_cm << "cm | ";
+        std::cout << "OBSTACLE: " << (data->obstacle_detected ? "YES" : "NO") << " | ";
+    }
     std::cout << "EMERGENCY: " << (data->emergency_stop ? "YES" : "NO") << " | ";
     std::cout << "SAFETY: " << (data->safety_override ? "ON" : "OFF");
     // Remove flush() and trailing spaces since we're doing event-based logging
@@ -114,6 +119,9 @@ void initializeAutonomousMode(BalanceData* data) {
     // Enable arrow detection for autonomous navigation
     data->arrow_detection_enabled = true;
     data->function_mode = ARROW_DETECTION;
+    
+    // Enable ultrasonic sensor for obstacle detection
+    data->ultrasonic_enabled = true;
     
     // Clear any emergency states
     data->emergency_stop = false;

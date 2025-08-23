@@ -59,6 +59,7 @@ cleanup() {
     pkill -TERM -f motor_process 2>/dev/null && print_status "✓ Motor process stop signal sent" || true
     pkill -TERM -f control_interface 2>/dev/null && print_status "✓ Control interface stop signal sent" || true
     pkill -TERM -f arrow_detection_process 2>/dev/null && print_status "✓ Arrow detection stop signal sent" || true
+    pkill -TERM -f ultrasonic_process 2>/dev/null && print_status "✓ Ultrasonic process stop signal sent" || true
     
     # Wait a moment for graceful shutdown
     sleep 2
@@ -69,6 +70,7 @@ cleanup() {
     pkill -KILL -f motor_process 2>/dev/null || true
     pkill -KILL -f control_interface 2>/dev/null || true
     pkill -KILL -f arrow_detection_process 2>/dev/null || true
+    pkill -KILL -f ultrasonic_process 2>/dev/null || true
     
     # Clean up shared memory
     rm -f /dev/shm/wall_e_balance 2>/dev/null && print_status "✓ Shared memory cleaned" || true
@@ -103,7 +105,7 @@ print_autonomous "⚠️  Only Ctrl+C to stop the system"
 echo
 
 # Check if executables exist
-REQUIRED_EXES="imu_process motor_process control_interface arrow_detection_process"
+REQUIRED_EXES="imu_process motor_process control_interface arrow_detection_process ultrasonic_process"
 
 for exe in $REQUIRED_EXES; do
     if [ ! -f "$exe" ]; then
@@ -219,6 +221,23 @@ fi
 
 print_success "Arrow detection process started (PID: $ARROW_PID)"
 
+# Start ultrasonic sensor process
+print_status "Starting ultrasonic sensor process..."
+./ultrasonic_process &
+ULTRASONIC_PID=$!
+
+# Wait for ultrasonic process to initialize
+sleep 1
+
+# Check if ultrasonic process is still running
+if ! kill -0 $ULTRASONIC_PID 2>/dev/null; then
+    print_warning "Ultrasonic process failed to start (GPIO issues possible)"
+    print_warning "System will continue without ultrasonic sensor"
+    ULTRASONIC_PID=""
+else
+    print_success "Ultrasonic sensor process started (PID: $ULTRASONIC_PID)"
+fi
+
 # Get IP address for streaming URL
 PI_IP=$(hostname -I | awk '{print $1}')
 
@@ -230,6 +249,11 @@ print_status "Process Information:"
 echo "  IMU Process PID: $IMU_PID"
 echo "  Motor Process PID: $MOTOR_PID"
 echo "  Arrow Detection PID: $ARROW_PID"
+if [ ! -z "$ULTRASONIC_PID" ]; then
+    echo "  Ultrasonic Sensor PID: $ULTRASONIC_PID"
+else
+    echo "  Ultrasonic Sensor: Not running"
+fi
 echo
 print_stream "📹 LIVE STREAMING ACTIVE!"
 if [ ! -z "$PI_IP" ]; then
