@@ -38,8 +38,10 @@ void signalHandler(int signal_num) {
 
 // Function to get a single character without blocking
 char getChar() {
-    // Always return 0 - no user input in autonomous mode
-    return 0;
+    char c = 0;
+    // Simple blocking input for mode selection
+    std::cin >> c;
+    return c;
 }
 
 void printAutonomousInfo() {
@@ -47,8 +49,13 @@ void printAutonomousInfo() {
     std::cout << "🤖 Robot operates independently" << std::endl;
     std::cout << "📹 Live streaming with arrow detection" << std::endl;
     std::cout << "🎯 Follows arrow directions automatically" << std::endl;
+    std::cout << "🚧 Obstacle avoidance scenario available" << std::endl;
     std::cout << "⚠️  Only Ctrl+C to stop the system" << std::endl;
-    std::cout << "\nPress Ctrl+C to stop autonomous operation:" << std::endl;
+    std::cout << "\nAvailable modes:" << std::endl;
+    std::cout << "  A - Arrow Detection Mode (default)" << std::endl;
+    std::cout << "  S - Arrow-Guided Obstacle Avoidance Scenario" << std::endl;
+    std::cout << "  Q - Quit (Ctrl+C)" << std::endl;
+    std::cout << "\nEnter selection: ";
 }
 
 std::string arrowDirectionToString(ArrowDirection dir) {
@@ -87,6 +94,7 @@ void printStatus(BalanceData* data) {
         case BLUETOOTH: function_str = "BLUETOOTH"; break;
         case FOLLOW2: function_str = "FOLLOW2"; break;
         case ARROW_DETECTION: function_str = "ARROW_DETECTION"; break;
+        case OBSTACLE_AVOIDANCE_SCENARIO: function_str = "OBSTACLE_SCENARIO"; break;
         default: function_str = "UNKNOWN"; break;
     }
     
@@ -110,6 +118,196 @@ void printStatus(BalanceData* data) {
     std::cout << "EMERGENCY: " << (data->emergency_stop ? "YES" : "NO") << " | ";
     std::cout << "SAFETY: " << (data->safety_override ? "ON" : "OFF");
     // Remove flush() and trailing spaces since we're doing event-based logging
+}
+
+void runObstacleAvoidanceScenario(BalanceData* data) {
+    std::cout << "\n🚧 Starting Arrow-Guided Obstacle Avoidance Scenario..." << std::endl;
+    std::cout << "📏 Robot will move forward and detect obstacles at 50cm" << std::endl;
+    std::cout << "🎯 When obstacle + arrow detected: Turn LEFT/RIGHT for 1 second, then continue" << std::endl;
+    std::cout << "❌ When obstacle without arrow: Stop scenario" << std::endl;
+    std::cout << "⚡ High-frequency monitoring (10ms) for instant response" << std::endl;
+    std::cout << "⚠️  Press Ctrl+C to stop the scenario" << std::endl;
+    std::cout << std::endl;
+    
+    // Set scenario mode
+    data->function_mode = OBSTACLE_AVOIDANCE_SCENARIO;
+    data->ultrasonic_enabled = true;
+    data->arrow_detection_enabled = true;  // Enable arrow detection for guidance
+    data->emergency_stop = false;
+    
+    // Initialize motion parameters
+    data->car_speed_integral = 0;
+    data->setting_car_speed = 0;
+    data->setting_turn_speed = 0;
+    
+    // Wait for ultrasonic sensor to be active
+    std::cout << "⏳ Waiting for ultrasonic sensor..." << std::endl;
+    int wait_count = 0;
+    while (!data->ultrasonic_active && wait_count < 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+    
+    if (!data->ultrasonic_active) {
+        std::cout << "❌ Ultrasonic sensor not available - scenario aborted" << std::endl;
+        data->motion_mode = STANDBY;
+        return;
+    }
+    
+    std::cout << "✓ Ultrasonic sensor ready!" << std::endl;
+    std::cout << "🎯 Arrow detection enabled for guidance!" << std::endl;
+    std::cout << "🚀 Starting forward motion..." << std::endl;
+    std::cout << "📏 Monitoring distance - will react at 50cm..." << std::endl;
+    
+    // Start moving forward
+    data->motion_mode = FORWARD;
+    data->setting_car_speed = 45;  // Slightly slower for better reaction time
+    
+    bool scenario_active = true;
+    bool obstacle_detected_at_50cm = false;
+    auto scenario_start_time = std::chrono::steady_clock::now();
+    
+    // More frequent monitoring for immediate response
+    while (scenario_active && running && !data->emergency_stop) {
+        // Check current ultrasonic distance
+        float current_distance = data->ultrasonic_distance_cm;
+        
+        // Display current distance every 20 cycles (200ms) for monitoring
+        static int display_counter = 0;
+        if (display_counter++ >= 20) {
+            if (current_distance > 0) {
+                std::string arrow_info = "";
+                if (data->arrow_detection_active && data->detected_arrow_direction != ARROW_NONE) {
+                    std::string arrow_dir = "";
+                    switch (data->detected_arrow_direction) {
+                        case ARROW_LEFT: arrow_dir = "LEFT"; break;
+                        case ARROW_RIGHT: arrow_dir = "RIGHT"; break;
+                        case ARROW_UP: arrow_dir = "UP"; break;
+                        case ARROW_DOWN: arrow_dir = "DOWN"; break;
+                        default: arrow_dir = "UNKNOWN"; break;
+                    }
+                    arrow_info = " | Arrow: " + arrow_dir + " (" + std::to_string((int)data->arrow_confidence) + "%)";
+                }
+                std::cout << "📏 Distance: " << current_distance << " cm" << arrow_info << std::endl;
+            }
+            display_counter = 0;
+        }
+        
+        // OBSTACLE DETECTED - Check for arrow guidance
+        if (current_distance <= 50.0f && current_distance > 0) {
+            std::cout << "🚧 OBSTACLE DETECTED AT 50cm THRESHOLD!" << std::endl;
+            std::cout << "📏 Exact distance: " << current_distance << " cm" << std::endl;
+            
+            // Check if there's a valid arrow detection for guidance
+            ArrowDirection arrow_dir = data->detected_arrow_direction;
+            bool has_arrow_guidance = (arrow_dir == ARROW_LEFT || arrow_dir == ARROW_RIGHT) && 
+                                     data->arrow_confidence > 70.0f && 
+                                     data->arrow_detection_active;
+            
+            if (has_arrow_guidance) {
+                std::cout << "🎯 ARROW DETECTED - Using for obstacle avoidance!" << std::endl;
+                std::cout << "📍 Arrow direction: " << (arrow_dir == ARROW_LEFT ? "LEFT" : "RIGHT") << std::endl;
+                std::cout << "🔄 Turning " << (arrow_dir == ARROW_LEFT ? "LEFT" : "RIGHT") << " for 1 second..." << std::endl;
+                
+                // Stop forward motion and start turning
+                data->motion_mode = (arrow_dir == ARROW_LEFT) ? TURNLEFT : TURNRIGHT;
+                data->setting_car_speed = 0;  // Stop forward motion
+                data->setting_turn_speed = 80; // Moderate turn speed
+                
+                // Turn for 1 second
+                auto turn_start = std::chrono::steady_clock::now();
+                while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - turn_start).count() < 1000) {
+                    
+                    // Check for emergency conditions during turn
+                    if (!running || data->emergency_stop || 
+                        !data->imu_active || !data->motor_active) {
+                        std::cout << "🚨 Emergency during turn - stopping!" << std::endl;
+                        data->motion_mode = STANDBY;
+                        data->setting_car_speed = 0;
+                        data->setting_turn_speed = 0;
+                        scenario_active = false;
+                        break;
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+                
+                if (scenario_active) {
+                    std::cout << "✅ Turn completed - resuming forward motion" << std::endl;
+                    // Resume forward motion
+                    data->motion_mode = FORWARD;
+                    data->setting_car_speed = 45;
+                    data->setting_turn_speed = 0;
+                    
+                    // Reset display counter for distance monitoring
+                    display_counter = 0;
+                }
+                
+            } else {
+                // No arrow guidance - stop scenario
+                std::cout << "❌ No valid arrow guidance detected" << std::endl;
+                std::cout << "🛑 Stopping scenario - obstacle avoidance complete" << std::endl;
+                
+                data->motion_mode = STANDBY;
+                data->setting_car_speed = 0;
+                data->setting_turn_speed = 0;
+                
+                std::cout << "✅ Obstacle avoidance scenario completed!" << std::endl;
+                obstacle_detected_at_50cm = true;
+                scenario_active = false;
+                break;
+            }
+        }
+        
+        // Safety timeout (30 seconds maximum)
+        auto current_time = std::chrono::steady_clock::now();
+        auto elapsed_time = std::chrono::duration_cast<std::chrono::seconds>(current_time - scenario_start_time);
+        if (elapsed_time.count() > 30) {
+            std::cout << "⏰ Scenario timeout (30 seconds) - stopping for safety" << std::endl;
+            data->motion_mode = STANDBY;
+            data->setting_car_speed = 0;
+            scenario_active = false;
+        }
+        
+        // Check for system failures
+        if (!data->imu_active || !data->motor_active || !data->ultrasonic_active) {
+            std::cout << "🚨 System component failure - aborting scenario" << std::endl;
+            if (!data->imu_active) std::cout << "❌ IMU system failure" << std::endl;
+            if (!data->motor_active) std::cout << "❌ Motor system failure" << std::endl;
+            if (!data->ultrasonic_active) std::cout << "❌ Ultrasonic system failure" << std::endl;
+            data->motion_mode = STANDBY;
+            data->setting_car_speed = 0;
+            data->setting_turn_speed = 0;
+            data->emergency_stop = true;
+            scenario_active = false;
+            break;
+        }
+        
+        // Warn if arrow detection is not working (but don't abort - scenario can continue)
+        if (!data->arrow_detection_active) {
+            static int arrow_warning_counter = 0;
+            if (arrow_warning_counter++ >= 100) {  // Warn every 1 second
+                std::cout << "⚠️  Arrow detection not active - will stop at obstacles" << std::endl;
+                arrow_warning_counter = 0;
+            }
+        }
+        
+        // Much faster monitoring for immediate response (10ms instead of 100ms)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    // Ensure robot is stopped
+    data->motion_mode = STANDBY;
+    data->setting_car_speed = 0;
+    data->setting_turn_speed = 0;
+    
+    std::cout << "\n📊 Arrow-Guided Obstacle Avoidance Scenario completed:" << std::endl;
+    std::cout << "   Final distance: " << data->ultrasonic_distance_cm << " cm" << std::endl;
+    std::cout << "   Robot mode: STANDBY" << std::endl;
+    std::cout << "   Obstacles encountered: " << (obstacle_detected_at_50cm ? "YES" : "NO") << std::endl;
+    std::cout << "   Arrow detection was: " << (data->arrow_detection_active ? "ACTIVE" : "INACTIVE") << std::endl;
+    std::cout << std::endl;
 }
 
 void initializeAutonomousMode(BalanceData* data) {
@@ -197,8 +395,44 @@ int main() {
     
     BalanceData* data = shm.getData();
     
-    // Initialize autonomous mode
-    initializeAutonomousMode(data);
+    // Show mode selection menu
+    printAutonomousInfo();
+    
+    char mode_selection = getChar();
+    std::cout << std::endl;
+    
+    switch (mode_selection) {
+        case 'A':
+        case 'a':
+            std::cout << "🎯 Arrow Detection Mode selected" << std::endl;
+            // Initialize autonomous mode (arrow detection)
+            initializeAutonomousMode(data);
+            break;
+            
+        case 'S':
+        case 's':
+            std::cout << "🚧 Arrow-Guided Obstacle Avoidance Scenario selected" << std::endl;
+            // Initialize basic balancing first
+            initializeAutonomousMode(data);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Let balancing stabilize
+            // Run the scenario
+            runObstacleAvoidanceScenario(data);
+            // Return to arrow detection mode after scenario
+            std::cout << "🔄 Returning to normal autonomous operation..." << std::endl;
+            data->function_mode = ARROW_DETECTION;
+            data->arrow_detection_enabled = true;
+            break;
+            
+        case 'Q':
+        case 'q':
+            std::cout << "👋 Exiting..." << std::endl;
+            return 0;
+            
+        default:
+            std::cout << "⚠️  Invalid selection, defaulting to Arrow Detection Mode" << std::endl;
+            initializeAutonomousMode(data);
+            break;
+    }
     
     // Variables to track status changes
     MotionMode last_motion_mode = data->motion_mode;
@@ -208,6 +442,8 @@ int main() {
     bool last_imu_active = data->imu_active;
     bool last_motor_active = data->motor_active;
     bool last_arrow_detection_active = data->arrow_detection_active;
+    bool last_ultrasonic_active = data->ultrasonic_active;
+    bool last_obstacle_detected = data->obstacle_detected;
     bool status_printed = false;
     
     while (running) {
@@ -221,7 +457,9 @@ int main() {
             data->emergency_stop != last_emergency_stop ||
             data->imu_active != last_imu_active ||
             data->motor_active != last_motor_active ||
-            data->arrow_detection_active != last_arrow_detection_active) {
+            data->arrow_detection_active != last_arrow_detection_active ||
+            data->ultrasonic_active != last_ultrasonic_active ||
+            data->obstacle_detected != last_obstacle_detected) {
             status_changed = true;
         }
         
@@ -242,6 +480,8 @@ int main() {
             last_imu_active = data->imu_active;
             last_motor_active = data->motor_active;
             last_arrow_detection_active = data->arrow_detection_active;
+            last_ultrasonic_active = data->ultrasonic_active;
+            last_obstacle_detected = data->obstacle_detected;
         }
         
         // Check for system failures
@@ -251,6 +491,18 @@ int main() {
             if (!data->motor_active) std::cout << "❌ Motor process not responding!" << std::endl;
             std::cout << "🛑 Initiating emergency shutdown..." << std::endl;
             break;
+        }
+        
+        // Special handling for obstacle avoidance scenario
+        if (data->function_mode == OBSTACLE_AVOIDANCE_SCENARIO) {
+            if (!data->ultrasonic_active) {
+                std::cout << "\n🚨 ULTRASONIC SENSOR FAILURE during scenario!" << std::endl;
+                std::cout << "🛑 Aborting scenario and stopping robot..." << std::endl;
+                data->motion_mode = STANDBY;
+                data->setting_car_speed = 0;
+                data->emergency_stop = true;
+                break;
+            }
         }
         
         // Monitor for autonomous operation issues

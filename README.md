@@ -171,12 +171,43 @@ make status
 ## Control Commands
 
 ### Autonomous Mode (Default)
-Wall-E now operates fully autonomously:
-- **No manual controls** - Robot follows arrow directions automatically
+Wall-E now operates fully autonomously with mode selection:
+- **Arrow Detection Mode** - Robot follows arrow directions automatically
+- **Arrow-Guided Obstacle Avoidance Scenario** - Robot moves forward, when obstacle detected within 50cm AND arrow present: turns in arrow direction for 1 second then continues, without arrow: stops scenario
 - **Live streaming** - Web browser access to camera feed with overlays
 - **System monitoring** - Real-time status display in terminal
 - **Emergency handling** - Automatic safety responses
 - **Ctrl+C only** - Single command to stop the entire system
+
+#### Mode Selection
+When starting the control interface, you can choose:
+- **A** - Arrow Detection Mode (default autonomous behavior)
+- **S** - Arrow-Guided Obstacle Avoidance Scenario (forward motion with intelligent obstacle avoidance using arrow guidance)
+- **Q** - Quit
+
+#### Arrow-Guided Obstacle Avoidance Scenario
+The arrow-guided obstacle avoidance scenario demonstrates intelligent navigation:
+1. Robot starts in STANDBY mode for balancing stabilization
+2. Enables both ultrasonic sensor AND arrow detection systems
+3. Transitions to FORWARD mode with moderate speed (45 PWM)
+4. Continuously monitors ultrasonic distance readings AND arrow detections
+5. When obstacle detected within 50cm:
+   - **WITH valid arrow (LEFT/RIGHT, >70% confidence)**: Turns in arrow direction for 1 second, then resumes forward motion
+   - **WITHOUT valid arrow**: Stops scenario and returns to STANDBY
+6. Includes safety timeout (30 seconds maximum) and system health monitoring
+7. After completion, returns to normal arrow detection mode
+
+**Turn Parameters:**
+- Turn speed: 80 PWM for moderate turning
+- Turn duration: Exactly 1 second
+- Valid arrows: LEFT/RIGHT directions with >70% confidence
+- Invalid arrows: UP/DOWN/UNKNOWN directions or low confidence
+
+**Safety Features:**
+- Automatic timeout protection (30 seconds maximum)
+- Real-time system health monitoring (IMU, motors, ultrasonic sensor)
+- Emergency stop on component failure
+- Moderate speed for safe operation
 
 The interface displays:
 - Balance angle and motion status
@@ -190,16 +221,21 @@ The interface displays:
 #### Autonomous Operation
 1. Start the system with `./wall_e.sh` or `make run`
 2. Wait for "AUTONOMOUS SYSTEM READY!" message
-3. Robot automatically starts balancing and arrow detection
-4. View live stream in web browser using displayed URL
-5. Robot follows detected arrows automatically
-6. Use Ctrl+C to stop the entire system
+3. Control interface will display mode selection menu:
+   - Press **A** for Arrow Detection Mode (default)
+   - Press **S** for Obstacle Avoidance Scenario
+   - Press **Q** to quit
+4. Robot automatically starts balancing and selected mode
+5. For Arrow Detection: View live stream in web browser using displayed URL
+6. For Scenario: Watch terminal output for obstacle detection progress
+7. Use Ctrl+C to stop the entire system
 
 **System Features:**
-- **Autonomous Mode**: Production use, demonstrations, autonomous operation
-- **Live Streaming**: Real-time camera feed with arrow detection overlays
+- **Arrow Detection Mode**: Production use, demonstrations, autonomous navigation
+- **Arrow-Guided Obstacle Avoidance Scenario**: Advanced demonstration combining ultrasonic obstacle detection with arrow-based navigation intelligence
+- **Live Streaming**: Real-time camera feed with arrow detection overlays (Arrow mode)
 - **Safety Monitoring**: Automatic emergency stop on system failures
-- **No User Input**: Prevents accidental commands during operation
+- **Mode Selection**: Choose between different operational modes at startup
 
 ## Technical Details
 

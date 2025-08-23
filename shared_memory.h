@@ -48,7 +48,8 @@ enum FunctionMode {
     FOLLOW = 3,
     BLUETOOTH = 4,
     FOLLOW2 = 5,
-    ARROW_DETECTION = 6
+    ARROW_DETECTION = 6,
+    OBSTACLE_AVOIDANCE_SCENARIO = 7
 };
 
 // Arrow direction enumeration
