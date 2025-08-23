@@ -333,6 +333,16 @@ make run
 - **Filter size**: 5 samples for stable readings
 - **GPIO pins**: Trigger on GPIO24, Echo on GPIO25
 
+### Live Stream Integration
+The ultrasonic sensor data is displayed in the live video stream as:
+- **Distance Bar**: Visual bar in top-right corner showing distance (0-100cm range)
+- **Color Coding**: 
+  - 🟢 Green: Safe distance (>30cm)
+  - 🟠 Orange: Close objects (20-30cm)
+  - 🔴 Red: Obstacle detected (<20cm)
+- **Real-time Updates**: Bar updates at 20Hz with distance measurements
+- **Text Display**: Numerical distance value and obstacle alerts
+
 ### Performance
 - **CPU Usage**: ~2-3% on Raspberry Pi 5
 - **Memory**: ~5MB usage
@@ -397,6 +407,7 @@ make run-with-arrows
   - Direction labels and confidence percentages
   - Contour outlines for detected shapes
   - System status (balance angle, emergency state)
+  - **Ultrasonic distance bar** (when ultrasonic sensor is active)
   - Frame count and processing statistics
 
 ### Arrow Detection Parameters
@@ -413,6 +424,7 @@ make run-with-arrows
 - **Latency**: ~50ms detection latency + ~100ms streaming latency
 - **Integration**: Seamless with existing shared memory system
 - **Network**: Minimal bandwidth usage, optimized for local viewing
+- **Console Output**: Silent operation - no detection logging, all feedback in live stream
 
 ## Troubleshooting
 
@@ -619,6 +631,8 @@ The ultrasonic sensor application has been successfully created and integrated i
 - **Safety Integration**: Configurable minimum safe distance
 - **Process Health**: Automatic monitoring and error handling
 - **Pi 5 Compatible**: Full GPIO offset detection for Raspberry Pi 5
+- **Live Stream Integration**: Visual distance bar overlay in camera feed
+- **Silent Operation**: No console debug output, all data visible in video overlay
 
 The ultrasonic sensor seamlessly integrates with your existing arrow detection, IMU, and motor control systems through the shared memory architecture, providing real-time obstacle detection capabilities to your self-balancing robot.
 

@@ -11,6 +11,10 @@
 
 #include "shared_memory.h"
 
+// Color codes for terminal output
+#define RED "\033[31m"
+#define NC "\033[0m"  // No Color
+
 // GPIO Pin definitions for ultrasonic sensor (BCM numbering)
 #define ULTRASONIC_TRIG_PIN     24  // GPIO24 - Trigger pin
 #define ULTRASONIC_ECHO_PIN     25  // GPIO25 - Echo pin
@@ -22,7 +26,7 @@ SharedMemoryManager* g_shm = nullptr;
 // Signal handler for clean shutdown
 void signalHandler(int signal __attribute__((unused))) {
     running = false;
-    std::cout << "\nShutting down ultrasonic sensor..." << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Shutting down ultrasonic sensor..." << std::endl;
     if (g_shm && g_shm->getData()) {
         g_shm->getData()->ultrasonic_active = false;
     }
@@ -64,7 +68,7 @@ private:
             int base;
             baseFile >> base;
             baseFile.close();
-            std::cout << "Detected Pi 5 RP1 GPIO chip with base " << base << std::endl;
+            std::cout << RED << "[Wall-E Auto]" << NC << " Detected Pi 5 RP1 GPIO chip with base " << base << std::endl;
             return base;
         }
         
@@ -87,7 +91,7 @@ public:
     GPIOPin(int pinNumber) : pin(pinNumber) {
         int offset = detectGPIOOffset();
         actualPin = pin + offset;
-        std::cout << "GPIO" << pin << " mapped to sysfs GPIO" << actualPin << std::endl;
+        std::cout << RED << "[Wall-E Auto]" << NC << " GPIO" << pin << " mapped to sysfs GPIO" << actualPin << std::endl;
     }
     
     bool exportPin() {
@@ -234,9 +238,9 @@ public:
     }
     
     bool initialize() {
-        std::cout << "Initializing ultrasonic sensor..." << std::endl;
-        std::cout << "Trigger pin: GPIO" << ULTRASONIC_TRIG_PIN << std::endl;
-        std::cout << "Echo pin: GPIO" << ULTRASONIC_ECHO_PIN << std::endl;
+        std::cout << RED << "[Wall-E Auto]" << NC << " Initializing ultrasonic sensor..." << std::endl;
+        std::cout << RED << "[Wall-E Auto]" << NC << " Trigger pin: GPIO" << ULTRASONIC_TRIG_PIN << std::endl;
+        std::cout << RED << "[Wall-E Auto]" << NC << " Echo pin: GPIO" << ULTRASONIC_ECHO_PIN << std::endl;
         
         // Export and configure GPIO pins
         if (!trigPin.exportPin() || !trigPin.setDirection("out")) {
@@ -254,7 +258,7 @@ public:
         usleep(100000); // 100ms initial delay
         
         initialized = true;
-        std::cout << "Ultrasonic sensor initialized successfully!" << std::endl;
+        std::cout << RED << "[Wall-E Auto]" << NC << " Ultrasonic sensor initialized successfully!" << std::endl;
         return true;
     }
     
@@ -338,7 +342,7 @@ int main() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
     
-    std::cout << "Starting Wall-E Ultrasonic Sensor Process..." << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Starting Wall-E Ultrasonic Sensor Process..." << std::endl;
     
     // Initialize shared memory (not as creator, control_interface should create it)
     SharedMemoryManager shm(false);
@@ -347,7 +351,7 @@ int main() {
     // Wait for shared memory to be created by another process
     int retry_count = 0;
     while (!shm.initialize() && retry_count < 100) {
-        std::cout << "Waiting for shared memory to be created..." << std::endl;
+        std::cout << RED << "[Wall-E Auto]" << NC << " Waiting for shared memory to be created..." << std::endl;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         retry_count++;
     }
@@ -369,8 +373,8 @@ int main() {
         return 1;
     }
     
-    std::cout << "Ultrasonic sensor process running..." << std::endl;
-    std::cout << "Minimum safe distance: " << data->ultrasonic_min_distance << " cm" << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Ultrasonic sensor process running..." << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Minimum safe distance: " << data->ultrasonic_min_distance << " cm" << std::endl;
     
     // Main measurement loop - 50ms cycle time (20Hz) for responsive obstacle detection
     auto next_cycle = std::chrono::steady_clock::now();
@@ -400,27 +404,18 @@ int main() {
             
             // Log obstacle state changes
             if (data->obstacle_detected && !previous_obstacle) {
-                std::cout << "OBSTACLE DETECTED! Distance: " << distance << " cm (min: " 
+                std::cout << RED << "[Wall-E Auto]" << NC << " OBSTACLE DETECTED! Distance: " << distance << " cm (min: " 
                           << data->ultrasonic_min_distance << " cm)" << std::endl;
             } else if (!data->obstacle_detected && previous_obstacle) {
-                std::cout << "Obstacle cleared. Distance: " << distance << " cm" << std::endl;
+                std::cout << RED << "[Wall-E Auto]" << NC << " Obstacle cleared. Distance: " << distance << " cm" << std::endl;
             }
             
             measurement_count++;
             
-            // Debug output every 2 seconds (40 cycles at 20Hz)
-            if (measurement_count % 40 == 0) {
-                std::cout << "Distance: " << distance << " cm | " 
-                          << "Obstacle: " << (data->obstacle_detected ? "YES" : "NO") << " | "
-                          << "Errors: " << error_count << std::endl;
-            }
+            // No debug output - data is visible in live stream overlay
         } else {
-            // Invalid measurement - increment error count but don't spam console
+            // Invalid measurement - increment error count silently
             error_count++;
-            // Only report errors periodically to avoid spam
-            if (error_count % 50 == 0) {
-                std::cerr << "Ultrasonic measurement errors: " << error_count << " (timeouts/out-of-range readings)" << std::endl;
-            }
         }
         
         // Precise timing control
@@ -439,9 +434,9 @@ int main() {
     data->obstacle_detected = false;
     sensor.cleanup();
     
-    std::cout << "Ultrasonic sensor process shutdown complete." << std::endl;
-    std::cout << "Total measurements: " << measurement_count << std::endl;
-    std::cout << "Total errors: " << error_count << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Ultrasonic sensor process shutdown complete." << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Total measurements: " << measurement_count << std::endl;
+    std::cout << RED << "[Wall-E Auto]" << NC << " Total errors: " << error_count << std::endl;
     
     return 0;
 }

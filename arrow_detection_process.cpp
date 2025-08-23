@@ -387,6 +387,33 @@ public:
         return 0.0f;
     }
     
+    float getUltrasonicDistance() {
+        if (standalone_mode) {
+            return 999.0f; // No ultrasonic data in standalone mode
+        } else if (balance_data) {
+            return balance_data->ultrasonic_distance_cm;
+        }
+        return 999.0f;
+    }
+    
+    bool isObstacleDetected() {
+        if (standalone_mode) {
+            return false; // No obstacle detection in standalone mode
+        } else if (balance_data) {
+            return balance_data->obstacle_detected;
+        }
+        return false;
+    }
+    
+    bool isUltrasonicActive() {
+        if (standalone_mode) {
+            return false; // No ultrasonic in standalone mode
+        } else if (balance_data) {
+            return balance_data->ultrasonic_active;
+        }
+        return false;
+    }
+    
     bool initRpicamVideo() {
         // Start rpicam-vid to stream to stdout which we'll pipe to opencv
         std::string command = "rpicam-vid --timeout 0 --width 640 --height 480 "
@@ -1041,32 +1068,6 @@ public:
                 setConfidence(bestConfidence);
                 setTimestamp(getCurrentTimeMicros());
                 
-                // Get current timestamp for logging
-                auto now = std::chrono::system_clock::now();
-                auto time_t = std::chrono::system_clock::to_time_t(now);
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-                
-                // Format timestamp as HH:MM:SS.mmm
-                std::stringstream timestamp;
-                timestamp << std::put_time(std::localtime(&time_t), "%H:%M:%S");
-                timestamp << "." << std::setfill('0') << std::setw(3) << ms.count();
-                
-                std::cout << "\n=== ARROW DETECTED ==="
-                         << "\nTimestamp: " << timestamp.str()
-                         << "\nDirection: " << bestDirection
-                         << "\nConfidence: " << std::fixed << std::setprecision(1) << bestConfidence << "%"
-                         << "\nArea: " << (int)bestArrowArea;
-                
-                // Add enhanced detection details
-                ArrowFeatures features = analyzeArrowFeatures(arrowCandidates[bestArrowIndex], frame);
-                std::cout << "\nDetection Details:"
-                         << "\n  - Corners: " << features.corner_count
-                         << "\n  - Triangularity: " << std::setprecision(1) << features.triangularity_score << "%"
-                         << "\n  - Tip Confidence: " << std::setprecision(1) << features.tip_confidence << "%"
-                         << "\n  - Symmetry: " << std::setprecision(1) << features.symmetry_score << "%"
-                         << "\n  - Edge Density: " << std::setprecision(1) << features.edge_density << "%"
-                         << "\n=====================\n" << std::endl;
-                
                 // Draw overlay for live streaming (if overlayFrame is provided)
                 if (overlayFrame != nullptr) {
                     cv::Rect bestBoundingRect = cv::boundingRect(arrowCandidates[bestArrowIndex]);
@@ -1157,10 +1158,6 @@ public:
         
         running = true;
         cv::Mat frame;
-        int frameCount = 0;
-        auto startTime = std::chrono::steady_clock::now();
-        auto lastFpsTime = startTime;
-        int fpsFrameCount = 0;
         
         std::cout << "Arrow detection active. Press Ctrl+C to stop." << std::endl;
         if (streaming_enabled) {
@@ -1180,8 +1177,6 @@ public:
             cv::Mat newFrame;
             if (cap.read(newFrame) && !newFrame.empty()) {
                 frame = newFrame.clone();
-                frameCount++;
-                fpsFrameCount++;
             }
             
             // Process the most recent frame
@@ -1203,29 +1198,62 @@ public:
                 cv::putText(displayFrame, systemText, cv::Point(10, 60), 
                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 0), 2);
                 
+                // Add ultrasonic distance bar overlay
+                if (isUltrasonicActive()) {
+                    float distance = getUltrasonicDistance();
+                    bool obstacle = isObstacleDetected();
+                    
+                    // Draw ultrasonic distance bar in top-right corner
+                    int barWidth = 200;
+                    int barHeight = 20;
+                    int barX = displayFrame.cols - barWidth - 20;  // 20px from right edge
+                    int barY = 20;  // 20px from top
+                    
+                    // Background bar (dark gray)
+                    cv::rectangle(displayFrame, cv::Point(barX, barY), 
+                                 cv::Point(barX + barWidth, barY + barHeight), 
+                                 cv::Scalar(50, 50, 50), -1);
+                    
+                    // Calculate fill based on distance (0-100cm range for display)
+                    float maxDisplayDistance = 100.0f;
+                    float fillRatio = std::min(distance / maxDisplayDistance, 1.0f);
+                    int fillWidth = (int)(barWidth * fillRatio);
+                    
+                    // Color based on obstacle detection
+                    cv::Scalar fillColor;
+                    if (obstacle) {
+                        fillColor = cv::Scalar(0, 0, 255);  // Red for obstacle
+                    } else if (distance < 30.0f) {
+                        fillColor = cv::Scalar(0, 165, 255);  // Orange for close
+                    } else {
+                        fillColor = cv::Scalar(0, 255, 0);  // Green for safe
+                    }
+                    
+                    // Fill bar
+                    if (fillWidth > 0) {
+                        cv::rectangle(displayFrame, cv::Point(barX, barY), 
+                                     cv::Point(barX + fillWidth, barY + barHeight), 
+                                     fillColor, -1);
+                    }
+                    
+                    // Border
+                    cv::rectangle(displayFrame, cv::Point(barX, barY), 
+                                 cv::Point(barX + barWidth, barY + barHeight), 
+                                 cv::Scalar(255, 255, 255), 2);
+                    
+                    // Distance text
+                    std::string distanceText = std::to_string((int)distance) + "cm";
+                    if (obstacle) distanceText += " OBSTACLE!";
+                    
+                    cv::putText(displayFrame, distanceText, cv::Point(barX, barY - 5), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                }
+                
                 // Add streaming status if enabled
                 if (streaming_enabled) {
                     // Update the streaming server with the latest frame
                     stream_server->updateFrame(displayFrame);
                 }
-            }
-            
-            auto currentTime = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastFpsTime);
-            
-            if (elapsed.count() >= 2) {
-                double fps = fpsFrameCount / elapsed.count();
-                std::cout << "\rProcessing at " << std::fixed << std::setprecision(1) 
-                         << fps << " FPS | Frames: " << frameCount 
-                         << " | Last Direction: " << arrowDirectionToString(getDetectedDirection()) 
-                         << " (" << std::setprecision(1) << getConfidence() << "%)";
-                if (streaming_enabled) {
-                    std::cout << " | Streaming: ON";
-                }
-                std::cout << "     " << std::flush;
-                
-                lastFpsTime = currentTime;
-                fpsFrameCount = 0;
             }
             
             // Update heartbeat

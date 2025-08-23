@@ -3,6 +3,7 @@ imu_process
 motor_process
 control_interface
 arrow_detection_process
+ultrasonic_process
 
 # Object files
 *.o
