@@ -225,6 +225,15 @@ private:
     std::chrono::steady_clock::time_point lastDetectionTime;
     cv::VideoCapture cap;
     
+    // Direction stability variables
+    std::string stableDirection;
+    int directionConfirmationCount;
+    static const int DIRECTION_CONFIRMATION_THRESHOLD = 5;  // Require 5 consistent readings (increased for better stability)
+    
+    // Additional stability tracking (moved from static variables to instance variables)
+    std::string pendingDirection;
+    int pendingCount;
+    
     // HTTP streaming
     std::unique_ptr<HTTPStreamServer> stream_server;
     bool streaming_enabled;
@@ -260,7 +269,8 @@ public:
         lastDetectedDirection("NONE"), streaming_enabled(enable_streaming), 
         streaming_port(port), standalone_mode(false),
         standalone_detected_direction(ARROW_NONE), standalone_confidence(0.0f),
-        standalone_detection_active(false) {
+        standalone_detection_active(false), stableDirection("NONE"), 
+        directionConfirmationCount(0), pendingDirection(""), pendingCount(0) {
         
         if (streaming_enabled) {
             stream_server = std::make_unique<HTTPStreamServer>(streaming_port);
@@ -524,9 +534,14 @@ public:
         cv::approxPolyDP(contour, approx, epsilon, true);
         features.corner_count = approx.size();
         
-        // 2. Enhanced tip detection to avoid side corners
+        // 2. Enhanced tip detection using equal-distance geometric relationship
+        // The tip should be the sharp corner that has two other sharp corners at equal distances
         std::vector<double> corner_angles;
         std::vector<double> tip_scores;
+        
+        // First pass: identify all sharp corners
+        std::vector<size_t> sharp_corner_indices;
+        std::vector<double> sharpness_values;
         
         for (size_t i = 0; i < approx.size(); i++) {
             cv::Point p1 = approx[(i - 1 + approx.size()) % approx.size()];
@@ -540,30 +555,110 @@ public:
             double cornerSharpness = 180.0 - (angle * 180.0 / CV_PI);
             corner_angles.push_back(angle * 180.0 / CV_PI);
             
-            // Calculate additional factors to distinguish true tip from side corners
+            // Consider a corner "sharp" if it's more acute than 100 degrees
+            if (cornerSharpness > 40.0) {
+                sharp_corner_indices.push_back(i);
+                sharpness_values.push_back(cornerSharpness);
+            }
+        }
+        
+        // Second pass: for each sharp corner, check if it has two other sharp corners at equal distances
+        for (size_t i = 0; i < approx.size(); i++) {
+            cv::Point p2 = approx[i];
+            double cornerSharpness = 180.0 - (corner_angles[i] * CV_PI / 180.0);
+            
+            // Initialize tip score with basic sharpness
+            double tipScore = cornerSharpness * 0.3; // 30% weight for basic sharpness
+            
+            // Calculate basic positional and isolation scores
             double distanceFromCenter = cv::norm(cv::Point2f(p2) - centroid);
             double maxPossibleDistance = std::max(bbox.width, bbox.height) / 2.0;
             double positionalScore = (distanceFromCenter / maxPossibleDistance) * 100.0;
             
-            // Calculate isolation score - tips should be more isolated
-            double minDistanceToOtherCorners = std::numeric_limits<double>::max();
-            for (size_t j = 0; j < approx.size(); j++) {
-                if (j == i) continue;
-                double dist = cv::norm(cv::Point2f(approx[j]) - cv::Point2f(p2));
-                minDistanceToOtherCorners = std::min(minDistanceToOtherCorners, dist);
-            }
-            double isolationScore = std::min(100.0, minDistanceToOtherCorners / 5.0);
-            
-            // Check if point is at shape boundary (tips are usually at extremes)
-            bool isAtLeft = (p2.x <= bbox.x + bbox.width * 0.25);
-            bool isAtRight = (p2.x >= bbox.x + bbox.width * 0.75);
-            bool isAtTop = (p2.y <= bbox.y + bbox.height * 0.25);
-            bool isAtBottom = (p2.y >= bbox.y + bbox.height * 0.75);
+            // Check if point is at shape boundary
+            bool isAtLeft = (p2.x <= bbox.x + bbox.width * 0.30);
+            bool isAtRight = (p2.x >= bbox.x + bbox.width * 0.70);
+            bool isAtTop = (p2.y <= bbox.y + bbox.height * 0.30);
+            bool isAtBottom = (p2.y >= bbox.y + bbox.height * 0.70);
             double boundaryScore = (isAtLeft || isAtRight || isAtTop || isAtBottom) ? 25.0 : 0.0;
             
-            // Combined tip score to distinguish real tips from side corners
-            double tipScore = (cornerSharpness * 0.4) + (positionalScore * 0.25) + 
-                             (isolationScore * 0.25) + (boundaryScore * 0.1);
+            // ENHANCED: Equal-distance relationship analysis
+            double equalDistanceScore = 0.0;
+            
+            if (cornerSharpness > 30.0) { // Only for reasonably sharp corners
+                // Find distances to all other sharp corners
+                std::vector<std::pair<double, size_t>> distances_to_sharp_corners;
+                
+                for (size_t j = 0; j < sharp_corner_indices.size(); j++) {
+                    size_t sharp_idx = sharp_corner_indices[j];
+                    if (sharp_idx == i) continue; // Skip self
+                    
+                    cv::Point other_corner = approx[sharp_idx];
+                    double distance = cv::norm(cv::Point2f(other_corner) - cv::Point2f(p2));
+                    distances_to_sharp_corners.push_back({distance, sharp_idx});
+                }
+                
+                // Sort distances
+                std::sort(distances_to_sharp_corners.begin(), distances_to_sharp_corners.end());
+                
+                // Check if we have at least 2 other sharp corners
+                if (distances_to_sharp_corners.size() >= 2) {
+                    double dist1 = distances_to_sharp_corners[0].first;
+                    double dist2 = distances_to_sharp_corners[1].first;
+                    
+                    // Calculate how close these distances are to being equal
+                    double distance_difference = abs(dist1 - dist2);
+                    double average_distance = (dist1 + dist2) / 2.0;
+                    double distance_ratio = distance_difference / average_distance;
+                    
+                    // If the two closest sharp corners are at nearly equal distances, this is likely the tip
+                    if (distance_ratio < 0.3) { // Within 30% of each other
+                        equalDistanceScore += 50.0; // Strong bonus for equal-distance pattern
+                        
+                        // Additional check: ensure these aren't too close (avoid detecting noise)
+                        if (average_distance > bbox.width * 0.2 && average_distance > bbox.height * 0.2) {
+                            equalDistanceScore += 30.0; // Extra bonus for well-spaced equal distances
+                        }
+                        
+                        // Verify geometric consistency: the two equidistant corners should form
+                        // the base of the arrow, and should be roughly aligned perpendicular to tip direction
+                        cv::Point corner1 = approx[distances_to_sharp_corners[0].second];
+                        cv::Point corner2 = approx[distances_to_sharp_corners[1].second];
+                        
+                        // Vector from corner1 to corner2 (base line)
+                        cv::Vec2f base_line(corner2.x - corner1.x, corner2.y - corner1.y);
+                        cv::normalize(base_line, base_line);
+                        
+                        // Vector from midpoint of base to tip
+                        cv::Point2f base_midpoint((corner1.x + corner2.x) / 2.0f, (corner1.y + corner2.y) / 2.0f);
+                        cv::Vec2f tip_direction(p2.x - base_midpoint.x, p2.y - base_midpoint.y);
+                        cv::normalize(tip_direction, tip_direction);
+                        
+                        // Check if tip direction is roughly perpendicular to base line
+                        double dot_product = abs(base_line.dot(tip_direction));
+                        double perpendicularity = 1.0 - dot_product; // 1.0 = perfectly perpendicular, 0.0 = parallel
+                        
+                        if (perpendicularity > 0.7) { // Reasonably perpendicular
+                            equalDistanceScore += 40.0; // Strong geometric consistency bonus
+                        } else if (perpendicularity > 0.5) {
+                            equalDistanceScore += 20.0; // Moderate geometric consistency bonus
+                        }
+                    } else if (distance_ratio < 0.5) { // Somewhat equal distances
+                        equalDistanceScore += 25.0; // Moderate bonus
+                    }
+                }
+                
+                // Special case: if we have exactly 3 sharp corners total (ideal arrow)
+                if (sharp_corner_indices.size() == 3) {
+                    equalDistanceScore += 30.0; // Bonus for classic arrow triangle shape
+                }
+            }
+            
+            // Combine all scoring factors
+            tipScore += positionalScore * 0.2;      // 20% weight for position from center
+            tipScore += boundaryScore * 0.1;        // 10% weight for boundary position
+            tipScore += equalDistanceScore * 0.4;   // 40% weight for equal-distance relationship
+            
             tip_scores.push_back(tipScore);
         }
         
@@ -572,7 +667,7 @@ public:
             auto max_it = std::max_element(tip_scores.begin(), tip_scores.end());
             size_t tip_idx = std::distance(tip_scores.begin(), max_it);
             
-            if (tip_idx < approx.size() && *max_it > 40.0) { // Minimum threshold for tip confidence
+            if (tip_idx < approx.size() && *max_it > 30.0) { // Reduced threshold for tip confidence
                 features.tip_point = cv::Point2f(approx[tip_idx]);
                 features.tip_confidence = *max_it;
             }
@@ -625,16 +720,31 @@ public:
         cv::Canny(roi, edges, 50, 150);
         features.edge_density = cv::sum(edges)[0] / (bbox.area() * 255.0) * 100.0;
         
-        // 7. Calculate base center (opposite to tip)
+        // 7. Calculate base center (ultra-stable geometric approach)
         if (features.tip_confidence > 0) {
-            // Find point furthest from tip
-            double max_dist = 0;
-            for (const auto& pt : contour) {
-                double dist = cv::norm(cv::Point2f(pt) - features.tip_point);
-                if (dist > max_dist) {
-                    max_dist = dist;
-                    features.base_center = cv::Point2f(pt);
-                }
+            // Use same ultra-stable base center calculation as in direction determination
+            cv::Moments contour_moments = cv::moments(contour);
+            cv::Point2f shape_centroid(contour_moments.m10 / contour_moments.m00, contour_moments.m01 / contour_moments.m00);
+            
+            // Calculate vector from tip to centroid
+            cv::Vec2f tip_to_centroid(shape_centroid.x - features.tip_point.x, shape_centroid.y - features.tip_point.y);
+            double centroid_distance = cv::norm(tip_to_centroid);
+            
+            if (centroid_distance > 5.0) {
+                // Normalize the tip-to-centroid vector
+                cv::Vec2f normalized_direction = tip_to_centroid / centroid_distance;
+                
+                // Project further along this direction to get stable base center
+                cv::Rect bbox = cv::boundingRect(contour);
+                double projection_distance = std::max(bbox.width, bbox.height) * 0.4; // 40% of arrow size
+                
+                features.base_center = cv::Point2f(
+                    shape_centroid.x + normalized_direction[0] * projection_distance,
+                    shape_centroid.y + normalized_direction[1] * projection_distance
+                );
+            } else {
+                // Fallback: if tip is too close to centroid, use centroid directly
+                features.base_center = shape_centroid;
             }
         }
         
@@ -815,156 +925,165 @@ public:
     std::string determineArrowDirection(const std::vector<cv::Point>& contour, const cv::Mat& originalImage) {
         if (contour.size() < 6) return "UNKNOWN";
         
-        // Get arrow features including tip detection
+        // Get arrow features including tip detection - USE SINGLE SOURCE OF TRUTH
         ArrowFeatures features = analyzeArrowFeatures(contour, originalImage);
         
         if (features.tip_confidence < 20.0) {
             return "UNKNOWN"; // Not confident enough about tip location
         }
         
+        // Use the tip and base center from the feature analysis - NO DUPLICATE CALCULATION
+        cv::Point2f tip = features.tip_point;
+        cv::Point2f base_center = features.base_center;
+        
+        // DEBUG: Show tip detection source
+        static int debug_counter_pre = 0;
+        if (++debug_counter_pre % 20 == 0) {
+            std::cout << "DEBUG TIP SOURCE: Using features.tip_point: (" << tip.x << "," << tip.y << ") confidence=" << features.tip_confidence << std::endl;
+        }
+        
+        // ROBUST DIRECTION DETERMINATION using TIP-TO-BASE VECTOR
+        // This approach is independent of arrow position in frame and bounding box fluctuations
+        
+        // SANITY CHECK: Detect if tip and base coordinates seem swapped
+        // For most arrow orientations, tip should be more extreme than base center
         cv::Rect bbox = cv::boundingRect(contour);
-        cv::Moments moments = cv::moments(contour);
-        if (moments.m00 == 0) return "UNKNOWN";
-        cv::Point2f centroid(moments.m10 / moments.m00, moments.m01 / moments.m00);
+        cv::Point2f bbox_center(bbox.x + bbox.width/2.0f, bbox.y + bbox.height/2.0f);
         
-        // Enhanced tip detection to avoid side corners
-        std::vector<cv::Point> approx;
-        double epsilon = 0.02 * cv::arcLength(contour, true);
-        cv::approxPolyDP(contour, approx, epsilon, true);
+        double tip_distance_from_bbox_center = cv::norm(tip - bbox_center);
+        double base_distance_from_bbox_center = cv::norm(base_center - bbox_center);
         
-        if (approx.size() < 3) return "UNKNOWN";
-        
-        // Find the actual tip by combining corner sharpness with positional analysis
-        cv::Point2f bestTip;
-        double bestTipScore = 0.0;
-        
-        for (size_t i = 0; i < approx.size(); i++) {
-            cv::Point p1 = approx[(i - 1 + approx.size()) % approx.size()];
-            cv::Point p2 = approx[i];
-            cv::Point p3 = approx[(i + 1) % approx.size()];
-            
-            cv::Vec2f v1(p1.x - p2.x, p1.y - p2.y);
-            cv::Vec2f v2(p3.x - p2.x, p3.y - p2.y);
-            
-            double angle = acos(v1.dot(v2) / (cv::norm(v1) * cv::norm(v2) + 1e-6));
-            double cornerSharpness = 180.0 - (angle * 180.0 / CV_PI);
-            
-            // Calculate positional score - true tips are usually at extremes
-            double distanceFromCenter = cv::norm(cv::Point2f(p2) - centroid);
-            double maxPossibleDistance = std::max(bbox.width, bbox.height) / 2.0;
-            double positionalScore = (distanceFromCenter / maxPossibleDistance) * 100.0;
-            
-            // Calculate isolation score - tips should be relatively isolated from other corners
-            double minDistanceToOtherCorners = std::numeric_limits<double>::max();
-            for (size_t j = 0; j < approx.size(); j++) {
-                if (j == i) continue;
-                double dist = cv::norm(cv::Point2f(approx[j]) - cv::Point2f(p2));
-                minDistanceToOtherCorners = std::min(minDistanceToOtherCorners, dist);
-            }
-            double isolationScore = std::min(100.0, minDistanceToOtherCorners / 10.0);
-            
-            // Calculate geometric consistency - check if this point makes sense as an arrow tip
-            // For an arrow pointing in a direction, the tip should be at one extreme
-            double geometricScore = 0.0;
-            
-            // Check if this point is at the boundary of the shape in a consistent direction
-            bool isAtLeft = (p2.x <= bbox.x + bbox.width * 0.2);
-            bool isAtRight = (p2.x >= bbox.x + bbox.width * 0.8);
-            bool isAtTop = (p2.y <= bbox.y + bbox.height * 0.2);
-            bool isAtBottom = (p2.y >= bbox.y + bbox.height * 0.8);
-            
-            // Arrows pointing left should have tip at left edge, etc.
-            if (isAtLeft || isAtRight || isAtTop || isAtBottom) {
-                geometricScore = 30.0;
-            }
-            
-            // Combine all scores to identify the true tip
-            // Weighted combination: sharpness (30%) + position (25%) + isolation (25%) + geometric (20%)
-            double totalScore = (cornerSharpness * 0.3) + (positionalScore * 0.25) + 
-                               (isolationScore * 0.25) + (geometricScore * 0.2);
-            
-            if (totalScore > bestTipScore && cornerSharpness > 30.0) { // Minimum sharpness required
-                bestTipScore = totalScore;
-                bestTip = cv::Point2f(p2);
+        // If base center is significantly further from bbox center than tip, they might be swapped
+        if (base_distance_from_bbox_center > tip_distance_from_bbox_center * 1.3) {
+            // Potential swap detected - use original tip/base but flag it
+            if (debug_counter_pre % 20 == 0) {
+                std::cout << "WARNING: Possible tip/base swap detected! TipDist=" << tip_distance_from_bbox_center 
+                         << " BaseDist=" << base_distance_from_bbox_center << std::endl;
             }
         }
         
-        if (bestTipScore < 40.0) {
-            return "UNKNOWN"; // Not confident enough about tip location
+        // Calculate the vector from base center to tip (pointing direction)
+        cv::Vec2f arrow_vector(tip.x - base_center.x, tip.y - base_center.y);
+        
+        // Normalize the vector to get direction only (magnitude independent)
+        double vector_magnitude = cv::norm(arrow_vector);
+        if (vector_magnitude < 5.0) {
+            return "UNKNOWN"; // Vector too short to determine direction reliably
         }
         
-        // Use the best detected tip point to determine direction
-        cv::Point2f tip = bestTip;
+        cv::Vec2f normalized_vector = arrow_vector / vector_magnitude;
         
-        // Find the base center (point furthest from tip)
-        cv::Point2f base_center;
-        double max_dist = 0;
-        for (const auto& pt : contour) {
-            double dist = cv::norm(cv::Point2f(pt) - tip);
-            if (dist > max_dist) {
-                max_dist = dist;
-                base_center = cv::Point2f(pt);
-            }
+        // Calculate angle in degrees (0° = right, 90° = down, 180° = left, 270° = up)
+        double angle_radians = atan2(normalized_vector[1], normalized_vector[0]);
+        double angle_degrees = angle_radians * 180.0 / CV_PI;
+        if (angle_degrees < 0) angle_degrees += 360.0; // Normalize to 0-360°
+        
+        // DEBUG: Print angle information to console
+        static int debug_counter = 0;
+        if (++debug_counter % 20 == 0) { // Print every 20 frames to avoid spam
+            std::cout << "DEBUG COORDS: Tip(" << tip.x << "," << tip.y << ") Base(" << base_center.x << "," << base_center.y << ")" << std::endl;
+            
+            // CRITICAL DEBUG: Check if coordinates make geometric sense
+            double tip_to_base_distance = cv::norm(cv::Point2f(tip.x - base_center.x, tip.y - base_center.y));
+            bool tip_is_right_of_base = tip.x > base_center.x;
+            bool tip_is_above_base = tip.y < base_center.y; // Y+ is down in OpenCV
+            
+            std::cout << "DEBUG GEOMETRY: Distance=" << tip_to_base_distance 
+                     << " TipRightOfBase=" << (tip_is_right_of_base ? "YES" : "NO")
+                     << " TipAboveBase=" << (tip_is_above_base ? "YES" : "NO") << std::endl;
+            
+            std::cout << "DEBUG VECTOR: (" << arrow_vector[0] << "," << arrow_vector[1] << ") normalized(" << normalized_vector[0] << "," << normalized_vector[1] << ")" << std::endl;
+            std::cout << "Vector angle: " << std::fixed << std::setprecision(1) << angle_degrees 
+                     << "° (current stable: " << stableDirection << ")";
         }
         
-        // Calculate direction vector from base to tip
-        cv::Vec2f direction_vector = tip - base_center;
-        double angle = atan2(direction_vector[1], direction_vector[0]) * 180.0 / CV_PI;
+        // SIMPLIFIED DIRECTION DETERMINATION - Use only wider ranges for stability
+        // No hysteresis - just use consistent wide ranges for all directions
         
-        // Normalize angle to 0-360 range
-        if (angle < 0) angle += 360.0;
+        // Define wide angle ranges for each direction
+        // RIGHT: 300° to 360° OR 0° to 60° (120° total range)
+        // DOWN: 30° to 150° (120° total range)
+        // LEFT: 120° to 240° (120° total range)
+        // UP: 210° to 330° (120° total range)
         
-        // Determine direction based on angle ranges with improved thresholds
-        if (angle >= 315.0 || angle < 45.0) {
+        // Check RIGHT direction (wide range)
+        if (angle_degrees >= 300.0 || angle_degrees <= 60.0) {
+            if (debug_counter % 20 == 0) std::cout << " -> raw: RIGHT (wide)" << std::endl;
             return "RIGHT";
-        } else if (angle >= 45.0 && angle < 135.0) {
+        }
+        
+        // Check DOWN direction (wide range)
+        if (angle_degrees >= 30.0 && angle_degrees <= 150.0) {
+            if (debug_counter % 20 == 0) std::cout << " -> raw: DOWN (wide)" << std::endl;
             return "DOWN";
-        } else if (angle >= 135.0 && angle < 225.0) {
+        }
+        
+        // Check LEFT direction (wide range)
+        if (angle_degrees >= 120.0 && angle_degrees <= 240.0) {
+            if (debug_counter % 20 == 0) std::cout << " -> raw: LEFT (wide)" << std::endl;
             return "LEFT";
-        } else if (angle >= 225.0 && angle < 315.0) {
+        }
+        
+        // Check UP direction (wide range)
+        if (angle_degrees >= 210.0 && angle_degrees <= 330.0) {
+            if (debug_counter % 20 == 0) std::cout << " -> raw: UP (wide)" << std::endl;
             return "UP";
         }
         
-        // Enhanced fallback method - variables prepared for future use
-        // bool isHorizontal = bbox.width > bbox.height * 1.2;
-        // bool isVertical = bbox.height > bbox.width * 1.2;
-        
-        // Find convex hull for clean extreme points
-        std::vector<cv::Point> hull;
-        cv::convexHull(contour, hull);
-        
-        cv::Point leftMost = hull[0], rightMost = hull[0];
-        cv::Point topMost = hull[0], bottomMost = hull[0];
-        
-        for (const cv::Point& pt : hull) {
-            if (pt.x < leftMost.x) leftMost = pt;
-            if (pt.x > rightMost.x) rightMost = pt;
-            if (pt.y < topMost.y) topMost = pt;
-            if (pt.y > bottomMost.y) bottomMost = pt;
-        }
-        
-        // Enhanced direction determination using tip position relative to shape bounds
-        double tipX = tip.x;
-        double tipY = tip.y;
-        double shapeLeft = bbox.x;
-        double shapeTop = bbox.y;
-        
-        // Calculate relative position of tip within bounding box
-        double relativeX = (tipX - shapeLeft) / bbox.width;  // 0.0 = left edge, 1.0 = right edge
-        double relativeY = (tipY - shapeTop) / bbox.height;  // 0.0 = top edge, 1.0 = bottom edge
-        
-        // Determine direction based on where the tip is positioned
-        if (relativeX <= 0.25) {
-            return "LEFT";   // Tip is on the left side
-        } else if (relativeX >= 0.75) {
-            return "RIGHT";  // Tip is on the right side
-        } else if (relativeY <= 0.25) {
-            return "UP";     // Tip is on the top side
-        } else if (relativeY >= 0.75) {
-            return "DOWN";   // Tip is on the bottom side
+        // DEBUG: Complete the debug line with the raw direction result
+        static int debug_counter_end = 0;
+        if (++debug_counter_end % 20 == 0) {
+            std::cout << " -> raw: UNKNOWN" << std::endl;
         }
         
         return "UNKNOWN";
+    }
+    
+    // Stable direction filtering to prevent flickering between directions
+    std::string getStableDirection(const std::string& rawDirection) {
+        // If no direction detected, maintain current stable direction (don't reset)
+        if (rawDirection == "UNKNOWN") {
+            // Don't reset on UNKNOWN - just maintain current stable direction
+            // This prevents flickering when tip is at boundary thresholds
+            return stableDirection.empty() ? "NONE" : stableDirection;
+        }
+        
+        if (rawDirection == "NONE") {
+            stableDirection = "NONE";
+            directionConfirmationCount = 0;
+            return "NONE";
+        }
+        
+        // If this is the same as our current stable direction, maintain it
+        if (rawDirection == stableDirection) {
+            // Reset confirmation counter when maintaining stable direction
+            directionConfirmationCount = DIRECTION_CONFIRMATION_THRESHOLD;
+            return stableDirection;
+        }
+        
+        // If this is a new direction, start confirmation process
+        if (rawDirection != stableDirection) {
+            // Check if this is the same as the last few readings (using instance variables now)
+            if (rawDirection == pendingDirection) {
+                pendingCount++;
+            } else {
+                pendingDirection = rawDirection;
+                pendingCount = 1;
+            }
+            
+            // Only change stable direction after consistent readings
+            if (pendingCount >= DIRECTION_CONFIRMATION_THRESHOLD) {
+                std::cout << "Direction change confirmed: " << stableDirection << " -> " << rawDirection << std::endl;
+                stableDirection = rawDirection;
+                directionConfirmationCount = DIRECTION_CONFIRMATION_THRESHOLD;
+                pendingCount = 0;
+                pendingDirection = "";
+                return stableDirection;
+            }
+        }
+        
+        // Return current stable direction while confirming new direction
+        return stableDirection;
     }
     
     std::vector<std::vector<cv::Point>> filterSpatiallyCloseContours(const std::vector<std::vector<cv::Point>>& contours) {
@@ -1144,7 +1263,10 @@ public:
             
             if (!isValidArrowShape(arrowCandidates[i], area, frame)) continue;
             
-            std::string direction = determineArrowDirection(arrowCandidates[i], frame);
+            std::string rawDirection = determineArrowDirection(arrowCandidates[i], frame);
+            
+            // Apply stable direction filtering to prevent flickering
+            std::string direction = getStableDirection(rawDirection);
             
             if (direction != "UNKNOWN") {
                 // Calculate confidence for this detection
@@ -1179,10 +1301,124 @@ public:
                     cv::putText(*overlayFrame, "TIP", 
                                cv::Point((int)features.tip_point.x - 15, (int)features.tip_point.y - 15), 
                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+                    
+                    // Draw base center point for debugging
+                    cv::circle(*overlayFrame, cv::Point((int)features.base_center.x, (int)features.base_center.y), 6, cv::Scalar(255, 0, 255), -1);
+                    cv::putText(*overlayFrame, "BASE", 
+                               cv::Point((int)features.base_center.x - 20, (int)features.base_center.y + 20), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 255), 1);
+                    
+                    // Draw X and Y axis lines at the base center reference point
+                    int base_x = (int)features.base_center.x;
+                    int base_y = (int)features.base_center.y;
+                    int axis_length = 40;
+                    
+                    // X-axis (horizontal) - Green
+                    cv::line(*overlayFrame, 
+                            cv::Point(base_x - axis_length, base_y),
+                            cv::Point(base_x + axis_length, base_y),
+                            cv::Scalar(0, 255, 0), 2);
+                    cv::putText(*overlayFrame, "X+", 
+                               cv::Point(base_x + axis_length + 5, base_y + 5), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(0, 255, 0), 1);
+                    
+                    // Y-axis (vertical) - Blue  
+                    cv::line(*overlayFrame, 
+                            cv::Point(base_x, base_y - axis_length),
+                            cv::Point(base_x, base_y + axis_length),
+                            cv::Scalar(255, 0, 0), 2);
+                    cv::putText(*overlayFrame, "Y+", 
+                               cv::Point(base_x + 5, base_y + axis_length + 15), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(255, 0, 0), 1);
+                    
+                    // DEBUG: Show the two base corners used for midpoint calculation
+                    // Recreate the base corner detection to show the corners visually
+                    std::vector<std::pair<double, cv::Point2f>> distance_points;
+                    for (const auto& pt : arrowCandidates[bestArrowIndex]) {
+                        double dist = cv::norm(cv::Point2f(pt) - features.tip_point);
+                        distance_points.push_back({dist, cv::Point2f(pt)});
+                    }
+                    std::sort(distance_points.begin(), distance_points.end(), 
+                             [](const auto& a, const auto& b) { return a.first > b.first; });
+                    
+                    if (distance_points.size() >= 2) {
+                        cv::Point2f corner1 = distance_points[0].second;
+                        
+                        // Find second corner with separation
+                        double min_separation = std::max(bestBoundingRect.width, bestBoundingRect.height) * 0.15;
+                        for (size_t i = 1; i < std::min(distance_points.size(), size_t(10)); i++) {
+                            cv::Point2f corner2 = distance_points[i].second;
+                            double separation = cv::norm(corner2 - corner1);
+                            
+                            if (separation >= min_separation) {
+                                // Draw the two base corners
+                                cv::circle(*overlayFrame, cv::Point((int)corner1.x, (int)corner1.y), 4, cv::Scalar(255, 255, 0), -1);
+                                cv::circle(*overlayFrame, cv::Point((int)corner2.x, (int)corner2.y), 4, cv::Scalar(255, 255, 0), -1);
+                                cv::putText(*overlayFrame, "C1", 
+                                           cv::Point((int)corner1.x - 15, (int)corner1.y - 10), 
+                                           cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(255, 255, 0), 1);
+                                cv::putText(*overlayFrame, "C2", 
+                                           cv::Point((int)corner2.x - 15, (int)corner2.y - 10), 
+                                           cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(255, 255, 0), 1);
+                                
+                                // Draw line between the two base corners
+                                cv::line(*overlayFrame, 
+                                        cv::Point((int)corner1.x, (int)corner1.y),
+                                        cv::Point((int)corner2.x, (int)corner2.y),
+                                        cv::Scalar(100, 100, 255), 1);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Draw vector line from base to tip
+                    cv::line(*overlayFrame, 
+                            cv::Point((int)features.base_center.x, (int)features.base_center.y),
+                            cv::Point((int)features.tip_point.x, (int)features.tip_point.y),
+                            cv::Scalar(0, 255, 255), 3);
+                    
+                    // Calculate and display vector angle for debugging
+                    cv::Vec2f arrow_vector(features.tip_point.x - features.base_center.x, features.tip_point.y - features.base_center.y);
+                    double vector_magnitude = cv::norm(arrow_vector);
+                    if (vector_magnitude > 5.0) {
+                        cv::Vec2f normalized_vector = arrow_vector / vector_magnitude;
+                        double angle_radians = atan2(normalized_vector[1], normalized_vector[0]);
+                        double angle_degrees = angle_radians * 180.0 / CV_PI;
+                        if (angle_degrees < 0) angle_degrees += 360.0;
+                        
+                        // DEBUG: Show detailed coordinate and vector information
+                        std::string coordText = "T(" + std::to_string((int)features.tip_point.x) + "," + std::to_string((int)features.tip_point.y) + 
+                                              ") B(" + std::to_string((int)features.base_center.x) + "," + std::to_string((int)features.base_center.y) + ")";
+                        cv::putText(*overlayFrame, coordText, 
+                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 25), 
+                                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
+                        
+                        std::string vectorText = "V(" + std::to_string((int)arrow_vector[0]) + "," + std::to_string((int)arrow_vector[1]) + ")";
+                        cv::putText(*overlayFrame, vectorText, 
+                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 40), 
+                                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
+                        
+                        std::string angleText = "Angle: " + std::to_string((int)angle_degrees) + "°";
+                        cv::putText(*overlayFrame, angleText, 
+                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 55), 
+                                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                        
+                        // Add current stable direction info for debugging
+                        std::string stableInfo = "Stable: " + stableDirection;
+                        cv::putText(*overlayFrame, stableInfo, 
+                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 65), 
+                                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(150, 150, 255), 1);
+                    }
                 }
                 
-                // Draw direction text above the arrow
-                cv::putText(*overlayFrame, bestDirection, 
+                // Draw direction text above the arrow with stability indicator
+                std::string directionText = bestDirection;
+                if (bestDirection == stableDirection) {
+                    directionText += " ✓"; // Stable direction indicator
+                } else {
+                    directionText += " ?"; // Pending confirmation indicator
+                }
+                cv::putText(*overlayFrame, directionText, 
                            cv::Point(bestBoundingRect.x, bestBoundingRect.y - 40), 
                            cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
                 
