@@ -266,11 +266,11 @@ private:
 public:
     ArrowDetectionProcess(bool enable_streaming = false, int port = 8080) : 
         running(false), shm(false), balance_data(nullptr), 
-        lastDetectedDirection("NONE"), streaming_enabled(enable_streaming), 
-        streaming_port(port), standalone_mode(false),
+        lastDetectedDirection("NONE"), stableDirection("NONE"), 
+        directionConfirmationCount(0), pendingDirection(""), pendingCount(0),
+        streaming_enabled(enable_streaming), streaming_port(port), standalone_mode(false),
         standalone_detected_direction(ARROW_NONE), standalone_confidence(0.0f),
-        standalone_detection_active(false), stableDirection("NONE"), 
-        directionConfirmationCount(0), pendingDirection(""), pendingCount(0) {
+        standalone_detection_active(false) {
         
         if (streaming_enabled) {
             stream_server = std::make_unique<HTTPStreamServer>(streaming_port);
@@ -925,42 +925,16 @@ public:
     std::string determineArrowDirection(const std::vector<cv::Point>& contour, const cv::Mat& originalImage) {
         if (contour.size() < 6) return "UNKNOWN";
         
-        // Get arrow features including tip detection - USE SINGLE SOURCE OF TRUTH
+        // Get arrow features including tip detection
         ArrowFeatures features = analyzeArrowFeatures(contour, originalImage);
         
         if (features.tip_confidence < 20.0) {
             return "UNKNOWN"; // Not confident enough about tip location
         }
         
-        // Use the tip and base center from the feature analysis - NO DUPLICATE CALCULATION
+        // Use the tip and base center from the feature analysis
         cv::Point2f tip = features.tip_point;
         cv::Point2f base_center = features.base_center;
-        
-        // DEBUG: Show tip detection source
-        static int debug_counter_pre = 0;
-        if (++debug_counter_pre % 20 == 0) {
-            std::cout << "DEBUG TIP SOURCE: Using features.tip_point: (" << tip.x << "," << tip.y << ") confidence=" << features.tip_confidence << std::endl;
-        }
-        
-        // ROBUST DIRECTION DETERMINATION using TIP-TO-BASE VECTOR
-        // This approach is independent of arrow position in frame and bounding box fluctuations
-        
-        // SANITY CHECK: Detect if tip and base coordinates seem swapped
-        // For most arrow orientations, tip should be more extreme than base center
-        cv::Rect bbox = cv::boundingRect(contour);
-        cv::Point2f bbox_center(bbox.x + bbox.width/2.0f, bbox.y + bbox.height/2.0f);
-        
-        double tip_distance_from_bbox_center = cv::norm(tip - bbox_center);
-        double base_distance_from_bbox_center = cv::norm(base_center - bbox_center);
-        
-        // If base center is significantly further from bbox center than tip, they might be swapped
-        if (base_distance_from_bbox_center > tip_distance_from_bbox_center * 1.3) {
-            // Potential swap detected - use original tip/base but flag it
-            if (debug_counter_pre % 20 == 0) {
-                std::cout << "WARNING: Possible tip/base swap detected! TipDist=" << tip_distance_from_bbox_center 
-                         << " BaseDist=" << base_distance_from_bbox_center << std::endl;
-            }
-        }
         
         // Calculate the vector from base center to tip (pointing direction)
         cv::Vec2f arrow_vector(tip.x - base_center.x, tip.y - base_center.y);
@@ -978,62 +952,24 @@ public:
         double angle_degrees = angle_radians * 180.0 / CV_PI;
         if (angle_degrees < 0) angle_degrees += 360.0; // Normalize to 0-360°
         
-        // DEBUG: Print angle information to console
-        static int debug_counter = 0;
-        if (++debug_counter % 20 == 0) { // Print every 20 frames to avoid spam
-            std::cout << "DEBUG COORDS: Tip(" << tip.x << "," << tip.y << ") Base(" << base_center.x << "," << base_center.y << ")" << std::endl;
-            
-            // CRITICAL DEBUG: Check if coordinates make geometric sense
-            double tip_to_base_distance = cv::norm(cv::Point2f(tip.x - base_center.x, tip.y - base_center.y));
-            bool tip_is_right_of_base = tip.x > base_center.x;
-            bool tip_is_above_base = tip.y < base_center.y; // Y+ is down in OpenCV
-            
-            std::cout << "DEBUG GEOMETRY: Distance=" << tip_to_base_distance 
-                     << " TipRightOfBase=" << (tip_is_right_of_base ? "YES" : "NO")
-                     << " TipAboveBase=" << (tip_is_above_base ? "YES" : "NO") << std::endl;
-            
-            std::cout << "DEBUG VECTOR: (" << arrow_vector[0] << "," << arrow_vector[1] << ") normalized(" << normalized_vector[0] << "," << normalized_vector[1] << ")" << std::endl;
-            std::cout << "Vector angle: " << std::fixed << std::setprecision(1) << angle_degrees 
-                     << "° (current stable: " << stableDirection << ")";
-        }
-        
-        // SIMPLIFIED DIRECTION DETERMINATION - Use only wider ranges for stability
-        // No hysteresis - just use consistent wide ranges for all directions
-        
-        // Define wide angle ranges for each direction
-        // RIGHT: 300° to 360° OR 0° to 60° (120° total range)
-        // DOWN: 30° to 150° (120° total range)
-        // LEFT: 120° to 240° (120° total range)
-        // UP: 210° to 330° (120° total range)
-        
         // Check RIGHT direction (wide range)
         if (angle_degrees >= 300.0 || angle_degrees <= 60.0) {
-            if (debug_counter % 20 == 0) std::cout << " -> raw: RIGHT (wide)" << std::endl;
             return "RIGHT";
         }
         
         // Check DOWN direction (wide range)
         if (angle_degrees >= 30.0 && angle_degrees <= 150.0) {
-            if (debug_counter % 20 == 0) std::cout << " -> raw: DOWN (wide)" << std::endl;
             return "DOWN";
         }
         
         // Check LEFT direction (wide range)
         if (angle_degrees >= 120.0 && angle_degrees <= 240.0) {
-            if (debug_counter % 20 == 0) std::cout << " -> raw: LEFT (wide)" << std::endl;
             return "LEFT";
         }
         
         // Check UP direction (wide range)
         if (angle_degrees >= 210.0 && angle_degrees <= 330.0) {
-            if (debug_counter % 20 == 0) std::cout << " -> raw: UP (wide)" << std::endl;
             return "UP";
-        }
-        
-        // DEBUG: Complete the debug line with the raw direction result
-        static int debug_counter_end = 0;
-        if (++debug_counter_end % 20 == 0) {
-            std::cout << " -> raw: UNKNOWN" << std::endl;
         }
         
         return "UNKNOWN";
@@ -1301,124 +1237,10 @@ public:
                     cv::putText(*overlayFrame, "TIP", 
                                cv::Point((int)features.tip_point.x - 15, (int)features.tip_point.y - 15), 
                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-                    
-                    // Draw base center point for debugging
-                    cv::circle(*overlayFrame, cv::Point((int)features.base_center.x, (int)features.base_center.y), 6, cv::Scalar(255, 0, 255), -1);
-                    cv::putText(*overlayFrame, "BASE", 
-                               cv::Point((int)features.base_center.x - 20, (int)features.base_center.y + 20), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 255), 1);
-                    
-                    // Draw X and Y axis lines at the base center reference point
-                    int base_x = (int)features.base_center.x;
-                    int base_y = (int)features.base_center.y;
-                    int axis_length = 40;
-                    
-                    // X-axis (horizontal) - Green
-                    cv::line(*overlayFrame, 
-                            cv::Point(base_x - axis_length, base_y),
-                            cv::Point(base_x + axis_length, base_y),
-                            cv::Scalar(0, 255, 0), 2);
-                    cv::putText(*overlayFrame, "X+", 
-                               cv::Point(base_x + axis_length + 5, base_y + 5), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(0, 255, 0), 1);
-                    
-                    // Y-axis (vertical) - Blue  
-                    cv::line(*overlayFrame, 
-                            cv::Point(base_x, base_y - axis_length),
-                            cv::Point(base_x, base_y + axis_length),
-                            cv::Scalar(255, 0, 0), 2);
-                    cv::putText(*overlayFrame, "Y+", 
-                               cv::Point(base_x + 5, base_y + axis_length + 15), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(255, 0, 0), 1);
-                    
-                    // DEBUG: Show the two base corners used for midpoint calculation
-                    // Recreate the base corner detection to show the corners visually
-                    std::vector<std::pair<double, cv::Point2f>> distance_points;
-                    for (const auto& pt : arrowCandidates[bestArrowIndex]) {
-                        double dist = cv::norm(cv::Point2f(pt) - features.tip_point);
-                        distance_points.push_back({dist, cv::Point2f(pt)});
-                    }
-                    std::sort(distance_points.begin(), distance_points.end(), 
-                             [](const auto& a, const auto& b) { return a.first > b.first; });
-                    
-                    if (distance_points.size() >= 2) {
-                        cv::Point2f corner1 = distance_points[0].second;
-                        
-                        // Find second corner with separation
-                        double min_separation = std::max(bestBoundingRect.width, bestBoundingRect.height) * 0.15;
-                        for (size_t i = 1; i < std::min(distance_points.size(), size_t(10)); i++) {
-                            cv::Point2f corner2 = distance_points[i].second;
-                            double separation = cv::norm(corner2 - corner1);
-                            
-                            if (separation >= min_separation) {
-                                // Draw the two base corners
-                                cv::circle(*overlayFrame, cv::Point((int)corner1.x, (int)corner1.y), 4, cv::Scalar(255, 255, 0), -1);
-                                cv::circle(*overlayFrame, cv::Point((int)corner2.x, (int)corner2.y), 4, cv::Scalar(255, 255, 0), -1);
-                                cv::putText(*overlayFrame, "C1", 
-                                           cv::Point((int)corner1.x - 15, (int)corner1.y - 10), 
-                                           cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(255, 255, 0), 1);
-                                cv::putText(*overlayFrame, "C2", 
-                                           cv::Point((int)corner2.x - 15, (int)corner2.y - 10), 
-                                           cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(255, 255, 0), 1);
-                                
-                                // Draw line between the two base corners
-                                cv::line(*overlayFrame, 
-                                        cv::Point((int)corner1.x, (int)corner1.y),
-                                        cv::Point((int)corner2.x, (int)corner2.y),
-                                        cv::Scalar(100, 100, 255), 1);
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Draw vector line from base to tip
-                    cv::line(*overlayFrame, 
-                            cv::Point((int)features.base_center.x, (int)features.base_center.y),
-                            cv::Point((int)features.tip_point.x, (int)features.tip_point.y),
-                            cv::Scalar(0, 255, 255), 3);
-                    
-                    // Calculate and display vector angle for debugging
-                    cv::Vec2f arrow_vector(features.tip_point.x - features.base_center.x, features.tip_point.y - features.base_center.y);
-                    double vector_magnitude = cv::norm(arrow_vector);
-                    if (vector_magnitude > 5.0) {
-                        cv::Vec2f normalized_vector = arrow_vector / vector_magnitude;
-                        double angle_radians = atan2(normalized_vector[1], normalized_vector[0]);
-                        double angle_degrees = angle_radians * 180.0 / CV_PI;
-                        if (angle_degrees < 0) angle_degrees += 360.0;
-                        
-                        // DEBUG: Show detailed coordinate and vector information
-                        std::string coordText = "T(" + std::to_string((int)features.tip_point.x) + "," + std::to_string((int)features.tip_point.y) + 
-                                              ") B(" + std::to_string((int)features.base_center.x) + "," + std::to_string((int)features.base_center.y) + ")";
-                        cv::putText(*overlayFrame, coordText, 
-                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 25), 
-                                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
-                        
-                        std::string vectorText = "V(" + std::to_string((int)arrow_vector[0]) + "," + std::to_string((int)arrow_vector[1]) + ")";
-                        cv::putText(*overlayFrame, vectorText, 
-                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 40), 
-                                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
-                        
-                        std::string angleText = "Angle: " + std::to_string((int)angle_degrees) + "°";
-                        cv::putText(*overlayFrame, angleText, 
-                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 55), 
-                                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-                        
-                        // Add current stable direction info for debugging
-                        std::string stableInfo = "Stable: " + stableDirection;
-                        cv::putText(*overlayFrame, stableInfo, 
-                                   cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 65), 
-                                   cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(150, 150, 255), 1);
-                    }
                 }
                 
-                // Draw direction text above the arrow with stability indicator
-                std::string directionText = bestDirection;
-                if (bestDirection == stableDirection) {
-                    directionText += " ✓"; // Stable direction indicator
-                } else {
-                    directionText += " ?"; // Pending confirmation indicator
-                }
-                cv::putText(*overlayFrame, directionText, 
+                // Draw direction text above the arrow
+                cv::putText(*overlayFrame, bestDirection, 
                            cv::Point(bestBoundingRect.x, bestBoundingRect.y - 40), 
                            cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
                 
@@ -1428,21 +1250,9 @@ public:
                            cv::Point(bestBoundingRect.x, bestBoundingRect.y - 15), 
                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                 
-                // Draw enhanced feature info below the arrow
-                std::string featureInfo = "Corners:" + std::to_string((int)features.corner_count) + 
-                                        " Tri:" + std::to_string((int)features.triangularity_score) + "%";
-                cv::putText(*overlayFrame, featureInfo, 
-                           cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 25), 
-                           cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
-                
                 // Draw contour outline for better visualization
                 std::vector<std::vector<cv::Point>> contours_draw = {arrowCandidates[bestArrowIndex]};
                 cv::drawContours(*overlayFrame, contours_draw, -1, cv::Scalar(255, 0, 0), 2);
-                
-                // Add "ENHANCED ARROW DETECTED" label to distinguish this detection
-                cv::putText(*overlayFrame, "ENHANCED ARROW DETECTED", 
-                           cv::Point(bestBoundingRect.x, bestBoundingRect.y - 70), 
-                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
             }
             
             // Update detection data only when direction changes or enough time has passed (for shared memory efficiency)
