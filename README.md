@@ -173,7 +173,7 @@ make status
 ### Autonomous Mode (Default)
 Wall-E now operates fully autonomously with mode selection:
 - **Arrow Detection Mode** - Robot follows arrow directions automatically
-- **Arrow-Guided Obstacle Avoidance Scenario** - Robot moves forward, when obstacle detected within 50cm AND arrow present: turns in arrow direction for 1 second then continues, without arrow: stops scenario
+- **Arrow-Guided Obstacle Avoidance Scenario** - Robot moves forward, when obstacle detected within 50cm: uses current OR persistent arrow direction to turn 90° (±5°), resets arrow memory after turn, without any arrow guidance: stops scenario
 - **Live streaming** - Web browser access to camera feed with overlays
 - **System monitoring** - Real-time status display in terminal
 - **Emergency handling** - Automatic safety responses
@@ -191,17 +191,27 @@ The arrow-guided obstacle avoidance scenario demonstrates intelligent navigation
 2. Enables both ultrasonic sensor AND arrow detection systems
 3. Transitions to FORWARD mode with moderate speed (45 PWM)
 4. Continuously monitors ultrasonic distance readings AND arrow detections
-5. When obstacle detected within 50cm:
-   - **WITH valid arrow (LEFT/RIGHT, >70% confidence)**: Turns in arrow direction for 1 second, then resumes forward motion
-   - **WITHOUT valid arrow**: Stops scenario and returns to STANDBY
-6. Includes safety timeout (30 seconds maximum) and system health monitoring
-7. After completion, returns to normal arrow detection mode
+5. **Persistent Arrow Memory**: Remembers last valid arrow direction even when arrow moves out of camera frame
+6. When obstacle detected within 50cm:
+   - **WITH valid arrow (current OR persistent, LEFT/RIGHT, >70% confidence)**: Turns 90° (±5°) in arrow direction using gyroscope feedback, then resumes forward motion
+   - **Arrow direction is RESET after each successful turn**, requiring new arrow detection for next obstacle
+   - **WITHOUT any arrow guidance (current or persistent)**: Stops scenario and returns to STANDBY
+7. Includes safety timeout (30 seconds maximum) and system health monitoring
+8. After completion, returns to normal arrow detection mode
+
+**Arrow Memory System:**
+- **Persistent Direction**: Last valid arrow direction is maintained even when arrow disappears from view
+- **Reset Trigger**: Arrow direction memory is cleared only after successful 90° turn completion
+- **Update Logic**: Memory updates whenever a new valid arrow (>70% confidence) is detected
+- **Navigation Continuity**: Enables consistent navigation even with intermittent arrow visibility
 
 **Turn Parameters:**
-- Turn speed: 80 PWM for moderate turning
-- Turn duration: Exactly 1 second
+- Turn speed: 70 PWM for precise control
+- Turn angle: 90° ± 5° tolerance using gyroscope position difference measurement
 - Valid arrows: LEFT/RIGHT directions with >70% confidence
 - Invalid arrows: UP/DOWN/UNKNOWN directions or low confidence
+- Safety timeout: 5 seconds maximum per turn attempt
+- **Angle Measurement**: Direct gyro_z position difference from start to current position (handles wraparound)
 
 **Safety Features:**
 - Automatic timeout protection (30 seconds maximum)
@@ -262,11 +272,14 @@ The system consists of four main processes:
    - Handles safety controls
 
 4. **Arrow Detection Process** (`arrow_detection_process.cpp`) - *Optional*
-   - Computer vision-based red arrow detection
-   - Real-time camera feed processing at 10-20 FPS
-   - Direction classification (LEFT, RIGHT, UP, DOWN)
-   - Confidence scoring and robust filtering
-   - Shares detection results via shared memory
+   - **Enhanced Computer Vision**: Advanced red arrow detection with improved tip detection
+   - **Multi-Factor Analysis**: Combines corner sharpness, positional analysis, isolation scoring, and boundary detection
+   - **Side Corner Filtering**: Prevents false detection of arrow side edges as the main tip
+   - **Real-time Processing**: Camera feed processing at 10-20 FPS
+   - **Accurate Direction Classification**: LEFT, RIGHT, UP, DOWN with improved reliability
+   - **Confidence Scoring**: Robust filtering with enhanced validation algorithms
+   - **Tip Position Analysis**: Uses relative tip position within bounding box for precise direction determination
+   - **Shares Detection Results**: Via shared memory for real-time robot navigation
 
 5. **Ultrasonic Sensor Process** (`ultrasonic_process.cpp`) - *Optional*
    - Distance measurement using HC-SR04 ultrasonic sensor

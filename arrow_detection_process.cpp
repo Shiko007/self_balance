@@ -26,6 +26,11 @@
 
 #include "shared_memory.h"
 
+// Global variables for signal handling
+extern volatile bool signal_received;
+extern volatile bool force_exit;
+class ArrowDetectionProcess;
+
 class HTTPStreamServer {
 private:
     int server_socket;
@@ -148,9 +153,9 @@ private:
             "        <p>Live camera feed with arrow detection overlay</p>\n"
             "        <p>Green boxes indicate detected arrows with direction and confidence</p>\n"
             "    </div>\n"
-            "    <img src=\"/stream\" width=\"640\" height=\"480\" alt=\"Live Stream\">\n"
+            "    <img src=\"/stream\" width=\"1280\" height=\"720\" alt=\"Live Stream\">\n"
             "    <div class=\"info\">\n"
-            "        <p>Stream Resolution: 640x480 | Refresh automatically</p>\n"
+            "        <p>Stream Resolution: 1280x720 | Refresh automatically</p>\n"
             "    </div>\n"
             "</body>\n"
             "</html>";
@@ -416,7 +421,7 @@ public:
     
     bool initRpicamVideo() {
         // Start rpicam-vid to stream to stdout which we'll pipe to opencv
-        std::string command = "rpicam-vid --timeout 0 --width 640 --height 480 "
+        std::string command = "rpicam-vid --timeout 0 --width 1280 --height 720 "
                              "--framerate 15 --codec mjpeg --output - 2>/dev/null";
         
         // Use popen to start the process and get a pipe to read from
@@ -443,7 +448,7 @@ public:
         }
         
         // Start rpicam-vid in background to write to fifo
-        std::string fifoCommand = "rpicam-vid --timeout 0 --width 640 --height 480 "
+        std::string fifoCommand = "rpicam-vid --timeout 0 --width 1280 --height 720 "
                                  "--framerate 20 --codec mjpeg --output " + fifoPath + " 2>/dev/null &";
         
         int result = system(fifoCommand.c_str());
@@ -519,8 +524,10 @@ public:
         cv::approxPolyDP(contour, approx, epsilon, true);
         features.corner_count = approx.size();
         
-        // 2. Find potential tip point using corner analysis
+        // 2. Enhanced tip detection to avoid side corners
         std::vector<double> corner_angles;
+        std::vector<double> tip_scores;
+        
         for (size_t i = 0; i < approx.size(); i++) {
             cv::Point p1 = approx[(i - 1 + approx.size()) % approx.size()];
             cv::Point p2 = approx[i];
@@ -530,16 +537,44 @@ public:
             cv::Vec2f v2(p3.x - p2.x, p3.y - p2.y);
             
             double angle = acos(v1.dot(v2) / (cv::norm(v1) * cv::norm(v2) + 1e-6));
+            double cornerSharpness = 180.0 - (angle * 180.0 / CV_PI);
             corner_angles.push_back(angle * 180.0 / CV_PI);
+            
+            // Calculate additional factors to distinguish true tip from side corners
+            double distanceFromCenter = cv::norm(cv::Point2f(p2) - centroid);
+            double maxPossibleDistance = std::max(bbox.width, bbox.height) / 2.0;
+            double positionalScore = (distanceFromCenter / maxPossibleDistance) * 100.0;
+            
+            // Calculate isolation score - tips should be more isolated
+            double minDistanceToOtherCorners = std::numeric_limits<double>::max();
+            for (size_t j = 0; j < approx.size(); j++) {
+                if (j == i) continue;
+                double dist = cv::norm(cv::Point2f(approx[j]) - cv::Point2f(p2));
+                minDistanceToOtherCorners = std::min(minDistanceToOtherCorners, dist);
+            }
+            double isolationScore = std::min(100.0, minDistanceToOtherCorners / 5.0);
+            
+            // Check if point is at shape boundary (tips are usually at extremes)
+            bool isAtLeft = (p2.x <= bbox.x + bbox.width * 0.25);
+            bool isAtRight = (p2.x >= bbox.x + bbox.width * 0.75);
+            bool isAtTop = (p2.y <= bbox.y + bbox.height * 0.25);
+            bool isAtBottom = (p2.y >= bbox.y + bbox.height * 0.75);
+            double boundaryScore = (isAtLeft || isAtRight || isAtTop || isAtBottom) ? 25.0 : 0.0;
+            
+            // Combined tip score to distinguish real tips from side corners
+            double tipScore = (cornerSharpness * 0.4) + (positionalScore * 0.25) + 
+                             (isolationScore * 0.25) + (boundaryScore * 0.1);
+            tip_scores.push_back(tipScore);
         }
         
-        // Find sharpest corner (likely arrow tip)
-        if (!corner_angles.empty()) {
-            auto min_it = std::min_element(corner_angles.begin(), corner_angles.end());
-            size_t tip_idx = std::distance(corner_angles.begin(), min_it);
-            if (tip_idx < approx.size()) {
+        // Find best tip candidate
+        if (!tip_scores.empty()) {
+            auto max_it = std::max_element(tip_scores.begin(), tip_scores.end());
+            size_t tip_idx = std::distance(tip_scores.begin(), max_it);
+            
+            if (tip_idx < approx.size() && *max_it > 40.0) { // Minimum threshold for tip confidence
                 features.tip_point = cv::Point2f(approx[tip_idx]);
-                features.tip_confidence = 180.0 - *min_it;  // Sharper corners have higher confidence
+                features.tip_confidence = *max_it;
             }
         }
         
@@ -555,8 +590,8 @@ public:
         }
         
         // 4. Symmetry Analysis
-        cv::RotatedRect fitted_rect = cv::fitEllipse(contour);
-        double orientation = fitted_rect.angle * CV_PI / 180.0;
+        // cv::RotatedRect fitted_rect = cv::fitEllipse(contour);
+        // Note: fitted_rect could be used for future advanced symmetry analysis
         
         // Check if shape is symmetric along major axis
         cv::Mat symmetry_mask = cv::Mat::zeros(bbox.height, bbox.width, CV_8UC1);
@@ -792,18 +827,94 @@ public:
         if (moments.m00 == 0) return "UNKNOWN";
         cv::Point2f centroid(moments.m10 / moments.m00, moments.m01 / moments.m00);
         
-        // Use detected tip point to determine direction
-        cv::Point2f tip = features.tip_point;
-        cv::Point2f base = features.base_center;
+        // Enhanced tip detection to avoid side corners
+        std::vector<cv::Point> approx;
+        double epsilon = 0.02 * cv::arcLength(contour, true);
+        cv::approxPolyDP(contour, approx, epsilon, true);
+        
+        if (approx.size() < 3) return "UNKNOWN";
+        
+        // Find the actual tip by combining corner sharpness with positional analysis
+        cv::Point2f bestTip;
+        double bestTipScore = 0.0;
+        
+        for (size_t i = 0; i < approx.size(); i++) {
+            cv::Point p1 = approx[(i - 1 + approx.size()) % approx.size()];
+            cv::Point p2 = approx[i];
+            cv::Point p3 = approx[(i + 1) % approx.size()];
+            
+            cv::Vec2f v1(p1.x - p2.x, p1.y - p2.y);
+            cv::Vec2f v2(p3.x - p2.x, p3.y - p2.y);
+            
+            double angle = acos(v1.dot(v2) / (cv::norm(v1) * cv::norm(v2) + 1e-6));
+            double cornerSharpness = 180.0 - (angle * 180.0 / CV_PI);
+            
+            // Calculate positional score - true tips are usually at extremes
+            double distanceFromCenter = cv::norm(cv::Point2f(p2) - centroid);
+            double maxPossibleDistance = std::max(bbox.width, bbox.height) / 2.0;
+            double positionalScore = (distanceFromCenter / maxPossibleDistance) * 100.0;
+            
+            // Calculate isolation score - tips should be relatively isolated from other corners
+            double minDistanceToOtherCorners = std::numeric_limits<double>::max();
+            for (size_t j = 0; j < approx.size(); j++) {
+                if (j == i) continue;
+                double dist = cv::norm(cv::Point2f(approx[j]) - cv::Point2f(p2));
+                minDistanceToOtherCorners = std::min(minDistanceToOtherCorners, dist);
+            }
+            double isolationScore = std::min(100.0, minDistanceToOtherCorners / 10.0);
+            
+            // Calculate geometric consistency - check if this point makes sense as an arrow tip
+            // For an arrow pointing in a direction, the tip should be at one extreme
+            double geometricScore = 0.0;
+            
+            // Check if this point is at the boundary of the shape in a consistent direction
+            bool isAtLeft = (p2.x <= bbox.x + bbox.width * 0.2);
+            bool isAtRight = (p2.x >= bbox.x + bbox.width * 0.8);
+            bool isAtTop = (p2.y <= bbox.y + bbox.height * 0.2);
+            bool isAtBottom = (p2.y >= bbox.y + bbox.height * 0.8);
+            
+            // Arrows pointing left should have tip at left edge, etc.
+            if (isAtLeft || isAtRight || isAtTop || isAtBottom) {
+                geometricScore = 30.0;
+            }
+            
+            // Combine all scores to identify the true tip
+            // Weighted combination: sharpness (30%) + position (25%) + isolation (25%) + geometric (20%)
+            double totalScore = (cornerSharpness * 0.3) + (positionalScore * 0.25) + 
+                               (isolationScore * 0.25) + (geometricScore * 0.2);
+            
+            if (totalScore > bestTipScore && cornerSharpness > 30.0) { // Minimum sharpness required
+                bestTipScore = totalScore;
+                bestTip = cv::Point2f(p2);
+            }
+        }
+        
+        if (bestTipScore < 40.0) {
+            return "UNKNOWN"; // Not confident enough about tip location
+        }
+        
+        // Use the best detected tip point to determine direction
+        cv::Point2f tip = bestTip;
+        
+        // Find the base center (point furthest from tip)
+        cv::Point2f base_center;
+        double max_dist = 0;
+        for (const auto& pt : contour) {
+            double dist = cv::norm(cv::Point2f(pt) - tip);
+            if (dist > max_dist) {
+                max_dist = dist;
+                base_center = cv::Point2f(pt);
+            }
+        }
         
         // Calculate direction vector from base to tip
-        cv::Vec2f direction_vector = tip - base;
+        cv::Vec2f direction_vector = tip - base_center;
         double angle = atan2(direction_vector[1], direction_vector[0]) * 180.0 / CV_PI;
         
         // Normalize angle to 0-360 range
         if (angle < 0) angle += 360.0;
         
-        // Determine direction based on angle ranges
+        // Determine direction based on angle ranges with improved thresholds
         if (angle >= 315.0 || angle < 45.0) {
             return "RIGHT";
         } else if (angle >= 45.0 && angle < 135.0) {
@@ -814,9 +925,9 @@ public:
             return "UP";
         }
         
-        // Fallback to original method if tip-based detection fails
-        bool isHorizontal = bbox.width > bbox.height * 1.2;
-        bool isVertical = bbox.height > bbox.width * 1.2;
+        // Enhanced fallback method - variables prepared for future use
+        // bool isHorizontal = bbox.width > bbox.height * 1.2;
+        // bool isVertical = bbox.height > bbox.width * 1.2;
         
         // Find convex hull for clean extreme points
         std::vector<cv::Point> hull;
@@ -832,30 +943,25 @@ public:
             if (pt.y > bottomMost.y) bottomMost = pt;
         }
         
-        // Calculate distances from centroid to each extreme
-        auto distance = [&](cv::Point pt) -> double {
-            return sqrt(pow(pt.x - centroid.x, 2) + pow(pt.y - centroid.y, 2));
-        };
+        // Enhanced direction determination using tip position relative to shape bounds
+        double tipX = tip.x;
+        double tipY = tip.y;
+        double shapeLeft = bbox.x;
+        double shapeTop = bbox.y;
         
-        if (isHorizontal) {
-            double leftDist = distance(leftMost);
-            double rightDist = distance(rightMost);
-            
-            if (leftDist > rightDist * 1.15) {  // Increased threshold for better accuracy
-                return "RIGHT";
-            } else if (rightDist > leftDist * 1.15) {
-                return "LEFT";
-            }
-            
-        } else if (isVertical) {
-            double topDist = distance(topMost);
-            double bottomDist = distance(bottomMost);
-            
-            if (topDist > bottomDist * 1.15) {
-                return "DOWN";
-            } else if (bottomDist > topDist * 1.15) {
-                return "UP";
-            }
+        // Calculate relative position of tip within bounding box
+        double relativeX = (tipX - shapeLeft) / bbox.width;  // 0.0 = left edge, 1.0 = right edge
+        double relativeY = (tipY - shapeTop) / bbox.height;  // 0.0 = top edge, 1.0 = bottom edge
+        
+        // Determine direction based on where the tip is positioned
+        if (relativeX <= 0.25) {
+            return "LEFT";   // Tip is on the left side
+        } else if (relativeX >= 0.75) {
+            return "RIGHT";  // Tip is on the right side
+        } else if (relativeY <= 0.25) {
+            return "UP";     // Tip is on the top side
+        } else if (relativeY >= 0.75) {
+            return "DOWN";   // Tip is on the bottom side
         }
         
         return "UNKNOWN";
@@ -1059,58 +1165,58 @@ public:
         
         // Update shared memory with detection results
         if (bestArrowIndex != SIZE_MAX) {
+            // Always draw overlay for live streaming when arrow is detected (no timing constraints)
+            if (overlayFrame != nullptr) {
+                cv::Rect bestBoundingRect = cv::boundingRect(arrowCandidates[bestArrowIndex]);
+                ArrowFeatures features = analyzeArrowFeatures(arrowCandidates[bestArrowIndex], frame);
+                
+                // Draw bounding rectangle around detected arrow
+                cv::rectangle(*overlayFrame, bestBoundingRect, cv::Scalar(0, 255, 0), 3);
+                
+                // Draw detected tip point
+                if (features.tip_confidence > 20.0) {
+                    cv::circle(*overlayFrame, cv::Point((int)features.tip_point.x, (int)features.tip_point.y), 8, cv::Scalar(0, 0, 255), -1);
+                    cv::putText(*overlayFrame, "TIP", 
+                               cv::Point((int)features.tip_point.x - 15, (int)features.tip_point.y - 15), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+                }
+                
+                // Draw direction text above the arrow
+                cv::putText(*overlayFrame, bestDirection, 
+                           cv::Point(bestBoundingRect.x, bestBoundingRect.y - 40), 
+                           cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                
+                // Draw confidence percentage
+                std::string confidenceText = std::to_string((int)bestConfidence) + "%";
+                cv::putText(*overlayFrame, confidenceText, 
+                           cv::Point(bestBoundingRect.x, bestBoundingRect.y - 15), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+                
+                // Draw enhanced feature info below the arrow
+                std::string featureInfo = "Corners:" + std::to_string((int)features.corner_count) + 
+                                        " Tri:" + std::to_string((int)features.triangularity_score) + "%";
+                cv::putText(*overlayFrame, featureInfo, 
+                           cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 25), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+                
+                // Draw contour outline for better visualization
+                std::vector<std::vector<cv::Point>> contours_draw = {arrowCandidates[bestArrowIndex]};
+                cv::drawContours(*overlayFrame, contours_draw, -1, cv::Scalar(255, 0, 0), 2);
+                
+                // Add "ENHANCED ARROW DETECTED" label to distinguish this detection
+                cv::putText(*overlayFrame, "ENHANCED ARROW DETECTED", 
+                           cv::Point(bestBoundingRect.x, bestBoundingRect.y - 70), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
+            }
+            
+            // Update detection data only when direction changes or enough time has passed (for shared memory efficiency)
             auto currentTime = std::chrono::steady_clock::now();
             if (bestDirection != lastDetectedDirection || 
-                std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastDetectionTime).count() > 50) {
+                std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastDetectionTime).count() > 100) {
                 
-                // Update detection data
                 setDetectedDirection(stringToArrowDirection(bestDirection));
                 setConfidence(bestConfidence);
                 setTimestamp(getCurrentTimeMicros());
-                
-                // Draw overlay for live streaming (if overlayFrame is provided)
-                if (overlayFrame != nullptr) {
-                    cv::Rect bestBoundingRect = cv::boundingRect(arrowCandidates[bestArrowIndex]);
-                    ArrowFeatures features = analyzeArrowFeatures(arrowCandidates[bestArrowIndex], frame);
-                    
-                    // Draw bounding rectangle around detected arrow
-                    cv::rectangle(*overlayFrame, bestBoundingRect, cv::Scalar(0, 255, 0), 3);
-                    
-                    // Draw detected tip point
-                    if (features.tip_confidence > 20.0) {
-                        cv::circle(*overlayFrame, cv::Point((int)features.tip_point.x, (int)features.tip_point.y), 8, cv::Scalar(0, 0, 255), -1);
-                        cv::putText(*overlayFrame, "TIP", 
-                                   cv::Point((int)features.tip_point.x - 15, (int)features.tip_point.y - 15), 
-                                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-                    }
-                    
-                    // Draw direction text above the arrow
-                    cv::putText(*overlayFrame, bestDirection, 
-                               cv::Point(bestBoundingRect.x, bestBoundingRect.y - 40), 
-                               cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-                    
-                    // Draw confidence percentage
-                    std::string confidenceText = std::to_string((int)bestConfidence) + "%";
-                    cv::putText(*overlayFrame, confidenceText, 
-                               cv::Point(bestBoundingRect.x, bestBoundingRect.y - 15), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
-                    
-                    // Draw enhanced feature info below the arrow
-                    std::string featureInfo = "Corners:" + std::to_string((int)features.corner_count) + 
-                                            " Tri:" + std::to_string((int)features.triangularity_score) + "%";
-                    cv::putText(*overlayFrame, featureInfo, 
-                               cv::Point(bestBoundingRect.x, bestBoundingRect.y + bestBoundingRect.height + 25), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
-                    
-                    // Draw contour outline for better visualization
-                    std::vector<std::vector<cv::Point>> contours_draw = {arrowCandidates[bestArrowIndex]};
-                    cv::drawContours(*overlayFrame, contours_draw, -1, cv::Scalar(255, 0, 0), 2);
-                    
-                    // Add "ENHANCED ARROW DETECTED" label to distinguish this detection
-                    cv::putText(*overlayFrame, "ENHANCED ARROW DETECTED", 
-                               cv::Point(bestBoundingRect.x, bestBoundingRect.y - 70), 
-                               cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
-                }
                 
                 lastDetectedDirection = bestDirection;
                 lastDetectionTime = currentTime;
@@ -1127,8 +1233,6 @@ public:
     }
     
     void run() {
-        extern volatile bool signal_received;
-        
         std::cout << "Wall-E Arrow Detection Process";
         if (streaming_enabled) {
             std::cout << " with Live Streaming";
@@ -1170,13 +1274,23 @@ public:
             std::cout << "Detection results are shared with Wall-E control system:\n" << std::endl;
         }
         
-        while (running && isDetectionEnabled() && !signal_received) {
+        while (running && isDetectionEnabled() && !::signal_received && !::force_exit) {
             auto loopStart = std::chrono::steady_clock::now();
+            
+            // Check for signal multiple times per loop for faster response
+            if (::signal_received || ::force_exit) {
+                break;
+            }
             
             // Try to get a new frame (non-blocking)
             cv::Mat newFrame;
             if (cap.read(newFrame) && !newFrame.empty()) {
                 frame = newFrame.clone();
+            }
+            
+            // Check signal again before processing
+            if (::signal_received || ::force_exit) {
+                break;
             }
             
             // Process the most recent frame
@@ -1260,17 +1374,21 @@ public:
             setDetectionActive(true);
             
             // Check for signal again for faster response
-            if (signal_received) {
+            if (::signal_received || ::force_exit) {
                 break;
             }
             
-            // Ensure we process every 10ms (100 FPS max)
+            // Ensure we process every 10ms (100 FPS max) but check signals during sleep
             auto loopEnd = std::chrono::steady_clock::now();
             auto loopDuration = std::chrono::duration_cast<std::chrono::milliseconds>(loopEnd - loopStart);
             auto remaining = std::chrono::milliseconds(10) - loopDuration;
             
             if (remaining > std::chrono::milliseconds(0)) {
-                std::this_thread::sleep_for(remaining);
+                // Sleep in small chunks to be responsive to signals
+                int sleepChunks = remaining.count();
+                for (int i = 0; i < sleepChunks && !::signal_received && !::force_exit; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
             }
         }
         
@@ -1278,71 +1396,90 @@ public:
     }
     
     void stop() {
+        extern volatile bool signal_received;
+        
+        std::cout << "🔄 Stopping arrow detection process..." << std::endl;
+        
         running = false;
+        signal_received = true;
         
         setDetectionActive(false);
         setDetectedDirection(ARROW_NONE);
         setConfidence(0.0f);
         
-        // Stop streaming server
+        // Stop streaming server immediately
         if (stream_server) {
+            std::cout << "✓ Stopping HTTP streaming server..." << std::endl;
             stream_server->stop();
         }
         
-        // Kill rpicam-vid processes immediately
-        system("pkill -TERM rpicam-vid");
-        usleep(100000); // Wait 100ms
-        system("pkill -KILL rpicam-vid");
+        // Kill rpicam-vid processes immediately and silently
+        std::cout << "✓ Stopping camera processes..." << std::endl;
+        system("pkill -TERM rpicam-vid 2>/dev/null");
+        usleep(50000); // Wait 50ms
+        system("pkill -KILL rpicam-vid 2>/dev/null");
+        
+        std::cout << "✓ Arrow detection stopped" << std::endl;
     }
     
     void cleanup() {
-        std::cout << "\n🔧 Cleaning up arrow detection process..." << std::endl;
+        extern volatile bool signal_received;
+        
+        if (signal_received) {
+            // Quick cleanup for signal-triggered shutdown
+            std::cout << "✓ Quick cleanup initiated..." << std::endl;
+        } else {
+            std::cout << "\n🔧 Cleaning up arrow detection process..." << std::endl;
+        }
         
         setDetectionActive(false);
         setDetectedDirection(ARROW_NONE);
         setConfidence(0.0f);
         
-        if (standalone_mode) {
-            std::cout << "✓ Standalone mode data cleared" << std::endl;
-        } else {
-            std::cout << "✓ Shared memory data cleared" << std::endl;
-        }
-        
         if (cap.isOpened()) {
             cap.release();
-            std::cout << "✓ Camera capture released" << std::endl;
+            if (!signal_received) std::cout << "✓ Camera capture released" << std::endl;
         }
         
-        // Stop streaming server
+        // Stop streaming server quickly
         if (stream_server) {
             stream_server->stop();
-            std::cout << "✓ HTTP streaming server stopped" << std::endl;
+            if (!signal_received) std::cout << "✓ HTTP streaming server stopped" << std::endl;
         }
         
-        // Kill rpicam-vid processes
-        std::cout << "🔄 Stopping rpicam-vid processes..." << std::endl;
-        system("pkill -TERM rpicam-vid");
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        system("pkill -KILL rpicam-vid");
-        std::cout << "✓ rpicam-vid processes stopped" << std::endl;
+        // Kill rpicam-vid processes immediately and silently
+        system("pkill -TERM rpicam-vid 2>/dev/null");
+        usleep(25000); // Reduced wait time for faster shutdown
+        system("pkill -KILL rpicam-vid 2>/dev/null");
         
-        // Remove FIFO
+        // Remove FIFO quickly
         unlink("/tmp/rpicam_arrow_fifo");
-        std::cout << "✓ FIFO pipe removed" << std::endl;
         
-        std::cout << "✅ Arrow detection process cleanup complete." << std::endl;
+        if (signal_received) {
+            std::cout << "✅ Arrow detection cleanup complete." << std::endl;
+        } else {
+            std::cout << "✅ Arrow detection process cleanup complete." << std::endl;
+        }
     }
 };
 
 // Global pointer for signal handling
 ArrowDetectionProcess* g_arrow_detector = nullptr;
 volatile bool signal_received = false;
+volatile bool force_exit = false;
 
-void signalHandler(int signum) {
+void signalHandler(int) {
+    if (force_exit) {
+        // Immediate exit if double signal
+        std::cout << "\nImmediate termination..." << std::endl;
+        _exit(1);
+    }
+    
     if (signal_received) {
-        // Force exit if already shutting down
+        // Second signal - force immediate exit
+        force_exit = true;
         std::cout << "\nForce terminating arrow detection..." << std::endl;
-        exit(1);
+        _exit(1);
     }
     
     signal_received = true;
@@ -1351,6 +1488,16 @@ void signalHandler(int signum) {
     if (g_arrow_detector) {
         g_arrow_detector->stop();
     }
+    
+    // Set a timeout for graceful shutdown
+    std::thread timeout_thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (signal_received) {
+            std::cout << "\nTimeout reached - forcing exit..." << std::endl;
+            _exit(1);
+        }
+    });
+    timeout_thread.detach();
 }
 
 int main(int argc, char* argv[]) {

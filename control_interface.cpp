@@ -9,14 +9,22 @@
 // Global variables for signal handling
 volatile bool running = true;
 volatile bool shutting_down = false;
+volatile bool force_exit = false;
 SharedMemoryManager* g_shm = nullptr;
 
 // Signal handler for clean shutdown
 void signalHandler(int signal_num) {
+    if (force_exit) {
+        // Immediate exit if triple signal
+        std::cout << "\nImmediate termination..." << std::endl;
+        _exit(1);
+    }
+    
     if (shutting_down) {
-        // Force exit if already shutting down
+        // Force exit if already shutting down and received second signal
+        force_exit = true;
         std::cout << "\nForce exit..." << std::endl;
-        exit(1);
+        _exit(1);
     }
     
     shutting_down = true;
@@ -30,10 +38,17 @@ void signalHandler(int signal_num) {
         std::cout << "⚠️  Please wait for all processes to stop safely" << std::endl;
         std::cout << "📡 Signal: SIGINT (Ctrl+C)" << std::endl;
         std::cout << std::endl;
-    } else {
-        // For other signals (like SIGTERM from wall_e.sh), just acknowledge quietly
-        // The main wall_e.sh script will handle the user messaging
     }
+    
+    // Set a timeout for graceful shutdown
+    std::thread timeout_thread([signal_num]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (shutting_down && signal_num == SIGINT) {
+            std::cout << "\nTimeout reached - forcing exit..." << std::endl;
+            _exit(1);
+        }
+    });
+    timeout_thread.detach();
 }
 
 // Function to get a single character without blocking
@@ -123,9 +138,10 @@ void printStatus(BalanceData* data) {
 void runObstacleAvoidanceScenario(BalanceData* data) {
     std::cout << "\n🚧 Starting Arrow-Guided Obstacle Avoidance Scenario..." << std::endl;
     std::cout << "📏 Robot will move forward and detect obstacles at 50cm" << std::endl;
-    std::cout << "🎯 When obstacle + arrow detected: Turn LEFT/RIGHT for 1 second, then continue" << std::endl;
+    std::cout << "🎯 When obstacle + arrow detected: Turn LEFT/RIGHT 90° (±5°), then continue" << std::endl;
     std::cout << "❌ When obstacle without arrow: Stop scenario" << std::endl;
     std::cout << "⚡ High-frequency monitoring (10ms) for instant response" << std::endl;
+    std::cout << "📐 Using gyroscope integration for precise angle measurement" << std::endl;
     std::cout << "⚠️  Press Ctrl+C to stop the scenario" << std::endl;
     std::cout << std::endl;
     
@@ -139,6 +155,9 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
     data->car_speed_integral = 0;
     data->setting_car_speed = 0;
     data->setting_turn_speed = 0;
+    
+    // Initialize persistent arrow direction (keeps last valid direction)
+    ArrowDirection persistent_arrow_direction = ARROW_NONE;
     
     // Wait for ultrasonic sensor to be active
     std::cout << "⏳ Waiting for ultrasonic sensor..." << std::endl;
@@ -161,7 +180,7 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
     
     // Start moving forward
     data->motion_mode = FORWARD;
-    data->setting_car_speed = 45;  // Slightly slower for better reaction time
+    data->setting_car_speed = 60;  // Slightly slower for better reaction time
     
     bool scenario_active = true;
     bool obstacle_detected_at_50cm = false;
@@ -172,11 +191,25 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
         // Check current ultrasonic distance
         float current_distance = data->ultrasonic_distance_cm;
         
+        // Continuously update persistent arrow direction when valid arrows are detected
+        ArrowDirection current_arrow = data->detected_arrow_direction;
+        if ((current_arrow == ARROW_LEFT || current_arrow == ARROW_RIGHT) && 
+            data->arrow_confidence > 70.0f && 
+            data->arrow_detection_active) {
+            if (persistent_arrow_direction != current_arrow) {
+                persistent_arrow_direction = current_arrow;
+                std::cout << "🎯 Arrow direction updated: " << (persistent_arrow_direction == ARROW_LEFT ? "LEFT" : "RIGHT") << std::endl;
+            }
+        }
+        
         // Display current distance every 20 cycles (200ms) for monitoring
         static int display_counter = 0;
         if (display_counter++ >= 20) {
             if (current_distance > 0) {
                 std::string arrow_info = "";
+                std::string persistent_info = "";
+                
+                // Current arrow info
                 if (data->arrow_detection_active && data->detected_arrow_direction != ARROW_NONE) {
                     std::string arrow_dir = "";
                     switch (data->detected_arrow_direction) {
@@ -186,9 +219,16 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
                         case ARROW_DOWN: arrow_dir = "DOWN"; break;
                         default: arrow_dir = "UNKNOWN"; break;
                     }
-                    arrow_info = " | Arrow: " + arrow_dir + " (" + std::to_string((int)data->arrow_confidence) + "%)";
+                    arrow_info = " | Current Arrow: " + arrow_dir + " (" + std::to_string((int)data->arrow_confidence) + "%)";
                 }
-                std::cout << "📏 Distance: " << current_distance << " cm" << arrow_info << std::endl;
+                
+                // Persistent arrow info
+                if (persistent_arrow_direction != ARROW_NONE) {
+                    std::string persist_dir = (persistent_arrow_direction == ARROW_LEFT) ? "LEFT" : "RIGHT";
+                    persistent_info = " | Persistent: " + persist_dir;
+                }
+                
+                std::cout << "📏 Distance: " << current_distance << " cm" << arrow_info << persistent_info << std::endl;
             }
             display_counter = 0;
         }
@@ -198,26 +238,45 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
             std::cout << "🚧 OBSTACLE DETECTED AT 50cm THRESHOLD!" << std::endl;
             std::cout << "📏 Exact distance: " << current_distance << " cm" << std::endl;
             
-            // Check if there's a valid arrow detection for guidance
-            ArrowDirection arrow_dir = data->detected_arrow_direction;
-            bool has_arrow_guidance = (arrow_dir == ARROW_LEFT || arrow_dir == ARROW_RIGHT) && 
-                                     data->arrow_confidence > 70.0f && 
-                                     data->arrow_detection_active;
-            
-            if (has_arrow_guidance) {
-                std::cout << "🎯 ARROW DETECTED - Using for obstacle avoidance!" << std::endl;
-                std::cout << "📍 Arrow direction: " << (arrow_dir == ARROW_LEFT ? "LEFT" : "RIGHT") << std::endl;
-                std::cout << "🔄 Turning " << (arrow_dir == ARROW_LEFT ? "LEFT" : "RIGHT") << " for 1 second..." << std::endl;
+            // Use persistent arrow direction for guidance (maintained from continuous monitoring)
+            if (persistent_arrow_direction == ARROW_LEFT || persistent_arrow_direction == ARROW_RIGHT) {
+                std::cout << "🧭 USING PERSISTENT ARROW GUIDANCE!" << std::endl;
+                std::cout << "📍 Arrow direction: " << (persistent_arrow_direction == ARROW_LEFT ? "LEFT" : "RIGHT") << std::endl;
+                std::cout << "🔄 Turning " << (persistent_arrow_direction == ARROW_LEFT ? "LEFT" : "RIGHT") << " 90 degrees..." << std::endl;
                 
                 // Stop forward motion and start turning
-                data->motion_mode = (arrow_dir == ARROW_LEFT) ? TURNLEFT : TURNRIGHT;
+                data->motion_mode = (persistent_arrow_direction == ARROW_LEFT) ? TURNLEFT : TURNRIGHT;
                 data->setting_car_speed = 0;  // Stop forward motion
-                data->setting_turn_speed = 80; // Moderate turn speed
+                data->setting_turn_speed = 60; // Moderate turn speed for precise control
                 
-                // Turn for 1 second
+                // Record starting gyro_z position for reference
+                float target_angle_change = 90.0f; // Target 90 degrees change
+                float angle_tolerance = 5.0f; // ±5 degrees tolerance
+                
+                // Wait for gyro to stabilize and get initial reading
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                float initial_gyro_z = data->gyro_z;
+                
                 auto turn_start = std::chrono::steady_clock::now();
-                while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::steady_clock::now() - turn_start).count() < 1000) {
+                
+                std::cout << "📐 Starting turn measurement..." << std::endl;
+                std::cout << "� Initial gyro_z: " << std::fixed << std::setprecision(1) << initial_gyro_z << "°" << std::endl;
+                
+                // Turn until we reach approximately 90 degrees difference from initial position
+                while (true) {
+                    float current_gyro_z = data->gyro_z;
+                    float angle_difference = abs(current_gyro_z - initial_gyro_z);
+                    
+                    // Handle wraparound (if gyro goes from 359° to 1°, etc.)
+                    if (angle_difference > 180.0f) {
+                        angle_difference = 360.0f - angle_difference;
+                    }
+                    
+                    // Check if we've reached the target
+                    if (angle_difference >= (target_angle_change - angle_tolerance)) {
+                        std::cout << "✅ Target angle reached: " << std::fixed << std::setprecision(1) << angle_difference << "°" << std::endl;
+                        break;
+                    }
                     
                     // Check for emergency conditions during turn
                     if (!running || data->emergency_stop || 
@@ -230,11 +289,37 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
                         break;
                     }
                     
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    // Safety timeout (maximum 5 seconds for a 90-degree turn)
+                    auto current_time = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - turn_start).count();
+                    if (elapsed > 5000) {
+                        std::cout << "⏰ Turn timeout - completing turn" << std::endl;
+                        break;
+                    }
+                    
+                    // Show progress every 50ms
+                    static int progress_counter = 0;
+                    if (progress_counter++ >= 5) {
+                        std::cout << "📐 Current angle difference: " << std::fixed << std::setprecision(1) << angle_difference << "° (target: " << target_angle_change << "°)" << std::endl;
+                        progress_counter = 0;
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
                 
                 if (scenario_active) {
-                    std::cout << "✅ Turn completed - resuming forward motion" << std::endl;
+                    float final_gyro_z = data->gyro_z;
+                    float final_angle_difference = abs(final_gyro_z - initial_gyro_z);
+                    if (final_angle_difference > 180.0f) {
+                        final_angle_difference = 360.0f - final_angle_difference;
+                    }
+                    
+                    std::cout << "✅ Turn completed: " << std::fixed << std::setprecision(1) << final_angle_difference << "° - resuming forward motion" << std::endl;
+                    
+                    // Reset persistent arrow direction after successful turn
+                    std::cout << "🔄 Resetting arrow guidance - ready for new direction" << std::endl;
+                    persistent_arrow_direction = ARROW_NONE;
+                    
                     // Resume forward motion
                     data->motion_mode = FORWARD;
                     data->setting_car_speed = 45;
@@ -245,9 +330,9 @@ void runObstacleAvoidanceScenario(BalanceData* data) {
                 }
                 
             } else {
-                // No arrow guidance - stop scenario
-                std::cout << "❌ No valid arrow guidance detected" << std::endl;
-                std::cout << "🛑 Stopping scenario - obstacle avoidance complete" << std::endl;
+                // No arrow guidance available (neither current nor persistent)
+                std::cout << "❌ No arrow guidance available (current or persistent)" << std::endl;
+                std::cout << "🛑 Stopping scenario - obstacle avoidance requires arrow guidance" << std::endl;
                 
                 data->motion_mode = STANDBY;
                 data->setting_car_speed = 0;
@@ -511,11 +596,16 @@ int main() {
             std::cout << "📐 Robot angle: " << data->kalman_angle << "°" << std::endl;
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Sleep in small chunks to be responsive to signals
+        for (int i = 0; i < 5 && running && !shutting_down && !force_exit; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
     
     // Clean shutdown sequence
-    std::cout << "\n🔧 Performing emergency stop and cleanup..." << std::endl;
+    if (shutting_down) {
+        std::cout << "\n🔧 Performing emergency stop and cleanup..." << std::endl;
+    }
     
     // Emergency stop before exit
     if (data) {
